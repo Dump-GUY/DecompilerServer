@@ -215,6 +215,18 @@ args:
 
 Release assets are packaged as framework-dependent single-file executables and still require the .NET 10 runtime.
 
+### Trusted Local Codex Install
+
+If Codex for Mac warns about the downloaded MCP executable, install the server from source instead of running a quarantined release artifact:
+
+```bash
+./scripts/install-codex-mcp.sh
+```
+
+The installer publishes an `osx-arm64` Release build to `~/.local/lib/decompiler-server/DecompilerServer`, removes quarantine metadata, signs the executable with the best local code-signing identity available, and updates Codex's global `decompiler` MCP entry to launch that installed copy.
+
+For local Codex stdio use, this avoids Safari/Gatekeeper quarantine state on downloaded binaries. For distributable Gatekeeper acceptance, sign with a `Developer ID Application` identity and notarize the archive before installation.
+
 ### Workflow Reference
 
 **Load one or more assemblies:**
@@ -321,11 +333,11 @@ The repo includes a portable skill at [skills/decompiler-mcp/SKILL.md](skills/de
 
 The GitHub `Release` workflow is triggered by pushing a tag that starts with `v` and matches the project version in `DecompilerServer.csproj`.
 
-For example, if the project version is `1.3.5`:
+For example, if the project version is `1.3.6`:
 
 ```bash
-git tag -a v1.3.5 -m "Release v1.3.5"
-git push origin v1.3.5
+git tag -a v1.3.6 -m "Release v1.3.6"
+git push origin v1.3.6
 ```
 
 ### Documentation
