@@ -223,7 +223,7 @@ If Codex for Mac warns about the downloaded MCP executable, install the server f
 ./scripts/install-codex-mcp.sh
 ```
 
-The installer publishes an `osx-arm64` Release build to `~/.local/lib/decompiler-server/DecompilerServer`, removes quarantine metadata, signs the executable with the best local code-signing identity available, and updates Codex's global `decompiler` MCP entry to launch that installed copy.
+The installer publishes an `osx-arm64` Release build to `~/.local/lib/decompiler-server/DecompilerServer`, removes quarantine metadata, signs the executable with the best local code-signing identity available, updates Codex's global `decompiler` MCP entry to launch that installed copy, installs the bundled `decompiler-mcp` skill into `~/.codex/skills/decompiler-mcp`, and maintains a managed DecompilerServer pointer block in `~/.codex/AGENTS.md`.
 
 For local Codex stdio use, this avoids Safari/Gatekeeper quarantine state on downloaded binaries. For distributable Gatekeeper acceptance, sign with a `Developer ID Application` identity and notarize the archive before installation.
 
@@ -327,7 +327,7 @@ After restore/build has already completed, `dotnet test -c Release --no-restore`
 
 ### Agent Skill
 
-The repo includes a portable skill at [skills/decompiler-mcp/SKILL.md](skills/decompiler-mcp/SKILL.md). Install or copy that folder into Codex, Claude, or another skill-aware assistant to bias agents toward the intended DecompilerServer workflow and away from premature shell fallbacks.
+The repo includes a portable skill at [skills/decompiler-mcp/SKILL.md](skills/decompiler-mcp/SKILL.md). For Codex, `./scripts/install-codex-mcp.sh` installs that skill and keeps the global `AGENTS.md` pointer up to date. For Claude or another skill-aware assistant, copy the skill folder manually to bias agents toward the intended DecompilerServer workflow and away from premature shell fallbacks.
 
 ### Releasing
 
