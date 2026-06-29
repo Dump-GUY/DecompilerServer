@@ -223,7 +223,7 @@ If Codex for Mac warns about the downloaded MCP executable, install the server f
 ./scripts/install-codex-mcp.sh
 ```
 
-The installer publishes an `osx-arm64` Release build to `~/.local/lib/decompiler-server/DecompilerServer`, removes quarantine metadata, signs the executable with the best local code-signing identity available, updates Codex's global `decompiler` MCP entry to launch that installed copy, installs the bundled `decompiler-mcp` skill into `~/.codex/skills/decompiler-mcp`, and maintains a managed DecompilerServer pointer block in `~/.codex/AGENTS.md`.
+The installer publishes an `osx-arm64` Release build to `~/.codex/mcp-servers/decompiler/DecompilerServer`, removes quarantine metadata, signs the executable with the best local code-signing identity available, updates Codex's global `decompiler` MCP entry to launch that installed copy, installs the bundled `decompiler-mcp` skill into `~/.codex/skills/decompiler-mcp`, and maintains a managed DecompilerServer pointer block in `~/.codex/AGENTS.md`.
 
 For local Codex stdio use, this avoids Safari/Gatekeeper quarantine state on downloaded binaries. For distributable Gatekeeper acceptance, sign with a `Developer ID Application` identity and notarize the archive before installation.
 

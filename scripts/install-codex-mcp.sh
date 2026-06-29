@@ -3,7 +3,7 @@ set -euo pipefail
 
 server_name="decompiler"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-install_dir="${INSTALL_DIR:-$HOME/.local/lib/decompiler-server}"
+install_dir="${INSTALL_DIR:-$HOME/.codex/mcp-servers/decompiler}"
 target="$install_dir/DecompilerServer"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 codex_skill_source="$repo_root/skills/decompiler-mcp"
