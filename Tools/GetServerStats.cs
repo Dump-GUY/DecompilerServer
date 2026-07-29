@@ -18,8 +18,7 @@ public static class GetServerStatsTool
                 DecompilerSession? session = null;
                 if (!string.IsNullOrWhiteSpace(contextAlias))
                 {
-                    if (!workspace.TryGetSession(contextAlias, out session!))
-                        throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded.");
+                    session = workspace.GetOrLoadSession(contextAlias);
                 }
                 else
                 {

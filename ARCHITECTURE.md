@@ -36,7 +36,7 @@ Responsibilities:
 - holds the alias-to-session map;
 - maps assembly MVID to alias for follow-up routing;
 - persists registrations to disk;
-- restores registered aliases at startup.
+- activates registered aliases on demand.
 
 Registry location:
 - default path is `LocalApplicationData/DecompilerServer/contexts.json`;
@@ -65,6 +65,8 @@ Owns one loaded assembly context and the expensive decompiler state:
 - assembly summary counts and settings.
 
 This is the boundary for one loaded assembly, not the whole process.
+
+Resolved dependency `PEFile` instances are owned by one `OwnedAssemblyResolver` per context. The resolver prefetches complete images so dependency streams do not retain native file descriptors, caches resolutions shared by the analysis and decompiler type systems, and deterministically disposes cached files with the context.
 
 ### MemberResolver
 
@@ -159,17 +161,18 @@ Operational rules:
 - `load_assembly` loads or replaces one alias;
 - omitted aliases normalize to the default alias `default`;
 - `makeCurrent` controls whether the loaded alias becomes the current one;
-- `list_contexts` reports loaded aliases and which one is current;
-- `select_context` changes the default alias;
+- `list_contexts` reports loaded contexts, all registered aliases, and which alias is current;
+- `select_context` changes the default alias and activates a registered alias if necessary;
 - `unload` can unload one alias or all aliases, and removes persisted registrations by default;
-- `unload(..., preserveRegistration: true)` keeps restart-restore registrations while unloading memory;
+- `unload(..., preserveRegistration: true)` keeps on-demand registrations while unloading memory;
 - `status` reports current alias plus loaded contexts when the workspace is active;
 - `get_server_stats(contextAlias)` reports detailed cache, index, and performance diagnostics for one alias or the current alias.
 
 Startup behavior:
-- `WorkspaceBootstrapService` restores persisted registrations;
-- startup logs announce each restored alias and its resolved assembly path;
-- failed restores are logged as warnings but do not abort server startup.
+- `WorkspaceBootstrapService` registers persisted aliases without opening assemblies;
+- startup logs one registration summary;
+- the current alias and explicitly requested `contextAlias` values load on first use;
+- MVID routing applies to contexts loaded in the current server process. After a restart, callers using an older member ID for a non-current deferred alias must pass its `contextAlias` once to activate the owning context.
 
 ## Stable API Contracts
 

@@ -7,7 +7,7 @@ namespace DecompilerServer;
 [McpServerToolType]
 public static class SelectContextTool
 {
-    [McpServerTool, Description("Select the current loaded assembly context by alias.")]
+    [McpServerTool, Description("Select the current assembly context by loaded or registered alias. Registered contexts are loaded on demand.")]
     public static string SelectContext(string contextAlias)
     {
         return ResponseFormatter.TryExecute(() =>

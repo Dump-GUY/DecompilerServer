@@ -22,7 +22,7 @@ public class AssemblyContextManager : IDisposable
     private ICompilation? _compilation;
     private CSharpDecompiler? _decompiler;
     private DecompilerSettings? _settings;
-    private UniversalAssemblyResolver? _resolver;
+    private OwnedAssemblyResolver? _resolver;
     private bool _disposed;
     private long _contextVersion;
     private readonly ReaderWriterLockSlim _lock = new();
@@ -76,7 +76,7 @@ public class AssemblyContextManager : IDisposable
                 throw new FileNotFoundException($"Assembly not found: {assemblyPath}");
 
             // Create resolver and add search directories
-            _resolver = new UniversalAssemblyResolver(assemblyPath, false, null);
+            _resolver = new OwnedAssemblyResolver(assemblyPath);
 
             // Add the assembly's directory as a search path
             var assemblyDir = Path.GetDirectoryName(assemblyPath);
@@ -111,6 +111,11 @@ public class AssemblyContextManager : IDisposable
             AssemblyPath = assemblyPath;
             LoadedAtUtc = DateTime.UtcNow;
         }
+        catch
+        {
+            DisposeContext();
+            throw;
+        }
         finally
         {
             _lock.ExitWriteLock();
@@ -137,7 +142,7 @@ public class AssemblyContextManager : IDisposable
                 throw new FileNotFoundException($"Assembly not found: {assemblyPath}");
 
             // Create resolver and add search directories
-            _resolver = new UniversalAssemblyResolver(assemblyPath, false, null);
+            _resolver = new OwnedAssemblyResolver(assemblyPath);
 
             // Add standard Unity search paths
             AddUnitySearchPaths(_resolver, gameDir);
@@ -169,6 +174,11 @@ public class AssemblyContextManager : IDisposable
 
             AssemblyPath = assemblyPath;
             LoadedAtUtc = DateTime.UtcNow;
+        }
+        catch
+        {
+            DisposeContext();
+            throw;
         }
         finally
         {
@@ -474,7 +484,7 @@ public class AssemblyContextManager : IDisposable
             .ToHashSet()!;
     }
 
-    private void AddUnitySearchPaths(UniversalAssemblyResolver resolver, string gameDir)
+    private void AddUnitySearchPaths(OwnedAssemblyResolver resolver, string gameDir)
     {
         // Generate Unity data directory patterns for dependency resolution
         var gameBaseName = Path.GetFileNameWithoutExtension(gameDir);
@@ -560,6 +570,7 @@ public class AssemblyContextManager : IDisposable
         _compilation = null;
         _peFile?.Dispose();
         _peFile = null;
+        _resolver?.Dispose();
         _resolver = null;
         AssemblyPath = null;
         Mvid = null;

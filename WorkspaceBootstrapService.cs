@@ -13,28 +13,18 @@ public sealed class WorkspaceBootstrapService(
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
-        var restored = _workspace.RestoreRegisteredContexts();
+        var registeredAliases = _workspace.ListRegisteredAliases();
 
-        if (restored.Count == 0)
+        if (registeredAliases.Count == 0)
         {
             _log.LogInformation("No registered workspace aliases found.");
             return Task.CompletedTask;
         }
 
-        foreach (var result in restored)
-        {
-            if (result.Loaded)
-            {
-                _log.LogInformation("Loaded registered context {Alias} -> {AssemblyPath}", result.ContextAlias, result.AssemblyPath);
-            }
-            else
-            {
-                _log.LogWarning("Failed to load registered context {Alias} -> {AssemblyPath}: {ErrorMessage}",
-                    result.ContextAlias,
-                    result.AssemblyPath,
-                    result.ErrorMessage);
-            }
-        }
+        _log.LogInformation(
+            "Registered {Count} workspace aliases for on-demand loading. Current alias: {CurrentAlias}",
+            registeredAliases.Count,
+            _workspace.CurrentContextAlias);
 
         return Task.CompletedTask;
     }

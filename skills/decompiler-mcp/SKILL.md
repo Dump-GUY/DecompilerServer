@@ -11,7 +11,7 @@ Use DecompilerServer as the primary source of truth for loaded .NET assemblies. 
 
 1. Load or confirm context:
    - `load_assembly` with `assemblyPath`, or `gameDir` plus `assemblyFile` for Unity layouts.
-   - `list_contexts` or `status` to confirm aliases and current context.
+   - `list_contexts` or `status` to confirm loaded and registered aliases and the current context. Passing `contextAlias` activates a registered alias on demand.
    - Use `get_server_stats` only when cache, index, or performance diagnostics matter.
 2. Discover symbols:
    - Use `search_symbols` first for fragments or when unsure whether a name is a type or member.

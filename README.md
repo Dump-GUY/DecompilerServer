@@ -244,13 +244,15 @@ load_assembly({
 })
 ```
 
-**Inspect loaded aliases:**
+**Inspect loaded and registered aliases:**
 
 ```text
 list_contexts({})
 status({})
 get_server_stats({ "contextAlias": "rw16" })
 ```
+
+Registered aliases are restored lazily when the server starts. `list_contexts` returns both the currently loaded context items and `registeredAliases`; selecting or explicitly addressing a registered alias loads it on demand. This keeps a large workspace history from consuming memory and file descriptors in every MCP client process.
 
 **Search and decompile:**
 
@@ -281,7 +283,7 @@ Once you have a `memberId`, follow-up tools normally route to the correct loaded
 
 For foreign-code exploration, prefer this path before falling back to shell tools:
 
-1. Load the assembly with `load_assembly` and verify the active alias with `list_contexts` or `status`.
+1. Load the assembly with `load_assembly`, or activate a registered alias by passing `contextAlias`, then verify the active alias with `list_contexts` or `status`.
 2. Start broad with `search_symbols` when you have a fragment; use `resolve_member_id` first when you have a fully-qualified or XML-doc-like guess such as `Namespace.Type.Member` or `M:Namespace.Type.Member`.
 3. Use `list_members` or `get_members_of_type` on the resolved type before guessing method IDs.
 4. Fetch code with `get_decompiled_source`, `get_source_slice`, or `plan_chunking`.
@@ -333,11 +335,11 @@ The repo includes a portable skill at [skills/decompiler-mcp/SKILL.md](skills/de
 
 The GitHub `Release` workflow is triggered by pushing a tag that starts with `v` and matches the project version in `DecompilerServer.csproj`.
 
-For example, if the project version is `1.3.6`:
+For example, if the project version is `1.3.7`:
 
 ```bash
-git tag -a v1.3.6 -m "Release v1.3.6"
-git push origin v1.3.6
+git tag -a v1.3.7 -m "Release v1.3.7"
+git push origin v1.3.7
 ```
 
 ### Documentation

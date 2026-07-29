@@ -20,8 +20,7 @@ internal static class ToolSessionRouter
             DecompilerSession session;
             if (!string.IsNullOrWhiteSpace(contextAlias))
             {
-                if (!workspace.TryGetSession(contextAlias, out session!))
-                    throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded.");
+                session = workspace.GetOrLoadSession(contextAlias);
             }
             else
             {
@@ -41,10 +40,7 @@ internal static class ToolSessionRouter
         {
             if (!string.IsNullOrWhiteSpace(contextAlias))
             {
-                if (!workspace.TryGetSession(contextAlias, out var explicitSession))
-                    throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded.");
-
-                return FromSession(explicitSession);
+                return FromSession(workspace.GetOrLoadSession(contextAlias));
             }
 
             return FromSession(workspace.ResolveSessionForMemberId(memberId));

@@ -7,7 +7,7 @@ namespace DecompilerServer;
 [McpServerToolType]
 public static class UnloadTool
 {
-    [McpServerTool, Description("Unload assembly and free all caches and indexes. Workspace registrations are removed by default; set preserveRegistration to keep restart restore behavior.")]
+    [McpServerTool, Description("Unload a loaded context or remove a deferred registration and free its caches and indexes. Registrations are removed by default; set preserveRegistration to keep on-demand activation.")]
     public static string Unload(string? contextAlias = null, bool all = false, bool preserveRegistration = false)
     {
         return ResponseFormatter.TryExecute<object>(() =>

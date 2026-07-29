@@ -57,6 +57,12 @@ public class WorkspaceToolTests : IDisposable
         Assert.Contains(items.EnumerateArray(), item => item.GetProperty("contextAlias").GetString() == "rw14");
         Assert.Contains(items.EnumerateArray(), item => item.GetProperty("contextAlias").GetString() == "rw15");
 
+        var registeredAliases = data.GetProperty("registeredAliases");
+        Assert.Collection(
+            registeredAliases.EnumerateArray(),
+            alias => Assert.Equal("rw14", alias.GetString()),
+            alias => Assert.Equal("rw15", alias.GetString()));
+
         foreach (var item in items.EnumerateArray())
         {
             var loadedAtUnix = item.GetProperty("loadedAtUnix").GetInt64();

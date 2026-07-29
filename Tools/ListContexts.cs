@@ -7,7 +7,7 @@ namespace DecompilerServer;
 [McpServerToolType]
 public static class ListContextsTool
 {
-    [McpServerTool, Description("List loaded assembly contexts and indicate which one is current.")]
+    [McpServerTool, Description("List loaded assembly contexts, registered aliases available for on-demand loading, and the current alias.")]
     public static string ListContexts()
     {
         return ResponseFormatter.TryExecute(() =>
@@ -25,7 +25,8 @@ public static class ListContextsTool
             return new WorkspaceContextsResult
             {
                 CurrentContextAlias = workspace.CurrentContextAlias,
-                Items = workspace.ListContexts().ToList()
+                Items = workspace.ListContexts().ToList(),
+                RegisteredAliases = workspace.ListRegisteredAliases().ToList()
             };
         });
     }

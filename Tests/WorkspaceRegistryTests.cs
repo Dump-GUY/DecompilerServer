@@ -43,7 +43,7 @@ public class WorkspaceRegistryTests : IDisposable
     }
 
     [Fact]
-    public void RestoreRegisteredContexts_LoadsKnownAliasesAndRestoresCurrentSelection()
+    public void RegisteredContexts_LoadOnlyWhenAddressed()
     {
         using (var firstWorkspace = new DecompilerWorkspace(_registryPath))
         {
@@ -66,11 +66,20 @@ public class WorkspaceRegistryTests : IDisposable
 
         using var restartedWorkspace = new DecompilerWorkspace(_registryPath);
 
-        var restoreResults = restartedWorkspace.RestoreRegisteredContexts();
-
-        Assert.Equal(2, restoreResults.Count);
-        Assert.All(restoreResults, result => Assert.True(result.Loaded, result.ErrorMessage));
         Assert.Equal("rw14", restartedWorkspace.CurrentContextAlias);
+        Assert.Equal(["rw14", "rw15"], restartedWorkspace.ListRegisteredAliases());
+        Assert.Empty(restartedWorkspace.ListContexts());
+        Assert.False(restartedWorkspace.TryGetCurrentSession(out _));
+
+        var rw15 = restartedWorkspace.GetOrLoadSession("rw15");
+
+        Assert.Equal("rw15", rw15.ContextAlias);
+        Assert.Equal("rw14", restartedWorkspace.CurrentContextAlias);
+        Assert.Single(restartedWorkspace.ListContexts());
+
+        var current = restartedWorkspace.GetCurrentSession();
+
+        Assert.Equal("rw14", current.ContextAlias);
         Assert.Equal(2, restartedWorkspace.ListContexts().Count);
     }
 
@@ -128,6 +137,37 @@ public class WorkspaceRegistryTests : IDisposable
 
         Assert.Contains(root.GetProperty("contexts").EnumerateArray(), item =>
             item.GetProperty("contextAlias").GetString() == "rw14");
+    }
+
+    [Fact]
+    public void UnloadContext_RemovesDeferredRegistrationWithoutLoadingIt()
+    {
+        using (var firstWorkspace = new DecompilerWorkspace(_registryPath))
+        {
+            firstWorkspace.LoadAssembly(new WorkspaceLoadRequest
+            {
+                AssemblyPath = TestAssemblyLocator.GetPath(),
+                ContextAlias = "rw14",
+                RebuildIndex = false,
+                MakeCurrent = true
+            });
+
+            firstWorkspace.LoadAssembly(new WorkspaceLoadRequest
+            {
+                AssemblyPath = typeof(global::EmbeddedSourceTestLibrary.EmbeddedSourceSample).Assembly.Location,
+                ContextAlias = "rw15",
+                RebuildIndex = false,
+                MakeCurrent = false
+            });
+        }
+
+        using var restartedWorkspace = new DecompilerWorkspace(_registryPath);
+        Assert.Empty(restartedWorkspace.ListContexts());
+
+        restartedWorkspace.UnloadContext("rw15");
+
+        Assert.Empty(restartedWorkspace.ListContexts());
+        Assert.Equal(["rw14"], restartedWorkspace.ListRegisteredAliases());
     }
 
     [Fact]
@@ -210,8 +250,10 @@ public class WorkspaceRegistryTests : IDisposable
         await bootstrapService.StartAsync(CancellationToken.None);
         await bootstrapService.StopAsync(CancellationToken.None);
 
-        Assert.Contains(logger.Messages, message => message.Contains("rw14", StringComparison.Ordinal));
-        Assert.Contains(logger.Messages, message => message.Contains(TestAssemblyLocator.GetPath(), StringComparison.Ordinal));
+        Assert.Empty(restartedWorkspace.ListContexts());
+        Assert.Contains(logger.Messages, message =>
+            message.Contains("1 workspace aliases", StringComparison.Ordinal)
+            && message.Contains("rw14", StringComparison.Ordinal));
     }
 }
 

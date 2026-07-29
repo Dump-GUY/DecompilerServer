@@ -13,6 +13,7 @@ public sealed class DecompilerWorkspace : IDisposable
     };
 
     private readonly ReaderWriterLockSlim _lock = new();
+    private readonly object _activationLock = new();
     private readonly Dictionary<string, DecompilerSession> _sessionsByAlias = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _aliasByMvid = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _registryPath;
@@ -25,6 +26,10 @@ public sealed class DecompilerWorkspace : IDisposable
     {
         _registryPath = registryPath ?? GetDefaultRegistryPath();
         _registryState = LoadRegistryState(_registryPath);
+        CurrentContextAlias = _registryState.Contexts.Any(entry =>
+            string.Equals(entry.ContextAlias, _registryState.CurrentContextAlias, StringComparison.OrdinalIgnoreCase))
+            ? _registryState.CurrentContextAlias
+            : null;
     }
 
     public WorkspaceContextInfo LoadAssembly(WorkspaceLoadRequest request)
@@ -79,12 +84,11 @@ public sealed class DecompilerWorkspace : IDisposable
         if (string.IsNullOrWhiteSpace(contextAlias))
             throw new ArgumentException("Context alias cannot be empty.", nameof(contextAlias));
 
+        var session = GetOrLoadSession(contextAlias);
+
         _lock.EnterWriteLock();
         try
         {
-            if (!_sessionsByAlias.TryGetValue(contextAlias, out var session))
-                throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded.");
-
             CurrentContextAlias = session.ContextAlias;
             SaveRegistryState();
             return session.ToContextInfo(isCurrent: true);
@@ -137,7 +141,21 @@ public sealed class DecompilerWorkspace : IDisposable
         if (TryGetCurrentSession(out var session))
             return session;
 
-        throw new InvalidOperationException("No context is currently selected.");
+        string? currentContextAlias;
+        _lock.EnterReadLock();
+        try
+        {
+            currentContextAlias = CurrentContextAlias;
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+
+        if (currentContextAlias == null)
+            throw new InvalidOperationException("No context is currently selected.");
+
+        return GetOrLoadSession(currentContextAlias);
     }
 
     public bool TryGetSession(string contextAlias, out DecompilerSession session)
@@ -148,6 +166,63 @@ public sealed class DecompilerWorkspace : IDisposable
         try
         {
             return _sessionsByAlias.TryGetValue(contextAlias, out session!);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    public DecompilerSession GetOrLoadSession(string contextAlias)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (string.IsNullOrWhiteSpace(contextAlias))
+            throw new ArgumentException("Context alias cannot be empty.", nameof(contextAlias));
+
+        if (TryGetSession(contextAlias, out var loadedSession))
+            return loadedSession;
+
+        lock (_activationLock)
+        {
+            if (TryGetSession(contextAlias, out loadedSession))
+                return loadedSession;
+
+            WorkspaceRegistryEntry? entry;
+            _lock.EnterReadLock();
+            try
+            {
+                entry = _registryState.Contexts.FirstOrDefault(candidate =>
+                    string.Equals(candidate.ContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
+            }
+            finally
+            {
+                _lock.ExitReadLock();
+            }
+
+            if (entry == null)
+                throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded or registered.");
+
+            LoadAssembly(CreateLoadRequest(entry));
+
+            if (TryGetSession(entry.ContextAlias, out loadedSession))
+                return loadedSession;
+
+            throw new InvalidOperationException($"Context alias '{contextAlias}' could not be loaded.");
+        }
+    }
+
+    public IReadOnlyList<string> ListRegisteredAliases()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        _lock.EnterReadLock();
+        try
+        {
+            return _registryState.Contexts
+                .Select(entry => entry.ContextAlias)
+                .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
         finally
         {
@@ -196,61 +271,6 @@ public sealed class DecompilerWorkspace : IDisposable
         return GetCurrentSession();
     }
 
-    public IReadOnlyList<WorkspaceRestoreResult> RestoreRegisteredContexts()
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        var entries = _registryState.Contexts
-            .OrderBy(entry => entry.ContextAlias, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        var results = new List<WorkspaceRestoreResult>();
-
-        foreach (var entry in entries)
-        {
-            try
-            {
-                var loadRequest = new WorkspaceLoadRequest
-                {
-                    GameDir = entry.GameDir,
-                    AssemblyPath = entry.AssemblyPath,
-                    AssemblyFile = entry.AssemblyFile,
-                    AdditionalSearchDirs = entry.AdditionalSearchDirs,
-                    RebuildIndex = entry.RebuildIndex,
-                    ContextAlias = entry.ContextAlias,
-                    MakeCurrent = false,
-                    PersistRegistration = false
-                };
-
-                var info = LoadAssembly(loadRequest);
-                results.Add(new WorkspaceRestoreResult
-                {
-                    ContextAlias = info.ContextAlias,
-                    AssemblyPath = info.AssemblyPath,
-                    Loaded = true
-                });
-            }
-            catch (Exception ex)
-            {
-                results.Add(new WorkspaceRestoreResult
-                {
-                    ContextAlias = entry.ContextAlias,
-                    AssemblyPath = entry.AssemblyPath ?? entry.GameDir ?? entry.AssemblyFile,
-                    Loaded = false,
-                    ErrorMessage = ex.Message
-                });
-            }
-        }
-
-        if (!string.IsNullOrWhiteSpace(_registryState.CurrentContextAlias) &&
-            TryGetSession(_registryState.CurrentContextAlias, out _))
-        {
-            SelectContext(_registryState.CurrentContextAlias);
-        }
-
-        return results;
-    }
-
     public void UnloadContext(string? contextAlias = null, bool preserveRegistration = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -262,20 +282,34 @@ public sealed class DecompilerWorkspace : IDisposable
             if (string.IsNullOrWhiteSpace(aliasToUnload))
                 throw new InvalidOperationException("No context is currently selected.");
 
-            if (!_sessionsByAlias.TryGetValue(aliasToUnload, out var session))
-                throw new InvalidOperationException($"Context alias '{aliasToUnload}' is not loaded.");
+            var isRegistered = _registryState.Contexts.Any(entry =>
+                string.Equals(entry.ContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase));
+            var isLoaded = _sessionsByAlias.TryGetValue(aliasToUnload, out var session);
+            if (!isLoaded && !isRegistered)
+                throw new InvalidOperationException($"Context alias '{aliasToUnload}' is not loaded or registered.");
 
-            RemoveSessionMappings(session);
-            session.Dispose();
+            var wasCurrent = string.Equals(CurrentContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase);
+            if (isLoaded)
+            {
+                RemoveSessionMappings(session!);
+                session!.Dispose();
+            }
 
             if (!preserveRegistration)
             {
                 _registryState.Contexts.RemoveAll(entry => string.Equals(entry.ContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase));
             }
 
-            if (CurrentContextAlias == null && _sessionsByAlias.Count > 0)
+            if (wasCurrent && preserveRegistration && isRegistered)
             {
-                CurrentContextAlias = _sessionsByAlias.Keys.OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase).First();
+                CurrentContextAlias = aliasToUnload;
+            }
+            else if (CurrentContextAlias == null)
+            {
+                CurrentContextAlias = _sessionsByAlias.Keys
+                    .Concat(_registryState.Contexts.Select(entry => entry.ContextAlias))
+                    .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
             }
 
             SaveRegistryState();
@@ -293,6 +327,7 @@ public sealed class DecompilerWorkspace : IDisposable
         _lock.EnterWriteLock();
         try
         {
+            var selectedAlias = CurrentContextAlias;
             foreach (var session in _sessionsByAlias.Values)
             {
                 session.Dispose();
@@ -300,9 +335,18 @@ public sealed class DecompilerWorkspace : IDisposable
 
             _sessionsByAlias.Clear();
             _aliasByMvid.Clear();
-            CurrentContextAlias = null;
             if (!preserveRegistration)
+            {
                 _registryState.Contexts.Clear();
+                CurrentContextAlias = null;
+            }
+            else
+            {
+                CurrentContextAlias = _registryState.Contexts.Any(entry =>
+                    string.Equals(entry.ContextAlias, selectedAlias, StringComparison.OrdinalIgnoreCase))
+                    ? selectedAlias
+                    : null;
+            }
             SaveRegistryState();
         }
         finally
@@ -359,6 +403,21 @@ public sealed class DecompilerWorkspace : IDisposable
     private static bool LooksLikeMvid(string prefix)
     {
         return Regex.IsMatch(prefix, "^[0-9A-Fa-f]{32}$");
+    }
+
+    private static WorkspaceLoadRequest CreateLoadRequest(WorkspaceRegistryEntry entry)
+    {
+        return new WorkspaceLoadRequest
+        {
+            GameDir = entry.GameDir,
+            AssemblyPath = entry.AssemblyPath,
+            AssemblyFile = entry.AssemblyFile,
+            AdditionalSearchDirs = entry.AdditionalSearchDirs,
+            RebuildIndex = entry.RebuildIndex,
+            ContextAlias = entry.ContextAlias,
+            MakeCurrent = false,
+            PersistRegistration = false
+        };
     }
 
     private void UpsertRegistryEntry(string contextAlias, WorkspaceLoadRequest request)
@@ -490,20 +549,28 @@ public sealed class DecompilerSession : IDisposable
     {
         var contextManager = new AssemblyContextManager();
 
-        if (request.GameDir != null)
-            contextManager.LoadAssembly(request.GameDir, request.AssemblyFile, request.AdditionalSearchDirs);
-        else
-            contextManager.LoadAssemblyDirect(request.AssemblyPath!, request.AdditionalSearchDirs);
+        try
+        {
+            if (request.GameDir != null)
+                contextManager.LoadAssembly(request.GameDir, request.AssemblyFile, request.AdditionalSearchDirs);
+            else
+                contextManager.LoadAssemblyDirect(request.AssemblyPath!, request.AdditionalSearchDirs);
 
-        if (request.RebuildIndex)
-            contextManager.WarmIndexes();
+            if (request.RebuildIndex)
+                contextManager.WarmIndexes();
 
-        var memberResolver = new MemberResolver(contextManager);
-        var decompilerService = new DecompilerService(contextManager, memberResolver);
-        var usageAnalyzer = new UsageAnalyzer(contextManager, memberResolver);
-        var inheritanceAnalyzer = new InheritanceAnalyzer(contextManager, memberResolver);
+            var memberResolver = new MemberResolver(contextManager);
+            var decompilerService = new DecompilerService(contextManager, memberResolver);
+            var usageAnalyzer = new UsageAnalyzer(contextManager, memberResolver);
+            var inheritanceAnalyzer = new InheritanceAnalyzer(contextManager, memberResolver);
 
-        return new DecompilerSession(contextAlias, contextManager, memberResolver, decompilerService, usageAnalyzer, inheritanceAnalyzer);
+            return new DecompilerSession(contextAlias, contextManager, memberResolver, decompilerService, usageAnalyzer, inheritanceAnalyzer);
+        }
+        catch
+        {
+            contextManager.Dispose();
+            throw;
+        }
     }
 
     public WorkspaceContextInfo ToContextInfo(bool isCurrent)
@@ -562,14 +629,6 @@ public sealed record WorkspaceContextInfo
     public int MethodCount { get; init; }
     public int NamespaceCount { get; init; }
     public bool IsCurrent { get; init; }
-}
-
-public sealed record WorkspaceRestoreResult
-{
-    public required string ContextAlias { get; init; }
-    public required string AssemblyPath { get; init; }
-    public bool Loaded { get; init; }
-    public string? ErrorMessage { get; init; }
 }
 
 internal sealed record WorkspaceRegistryState

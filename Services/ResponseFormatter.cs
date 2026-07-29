@@ -347,6 +347,7 @@ public record WorkspaceContextsResult
 {
     public string? CurrentContextAlias { get; init; }
     public required List<WorkspaceContextInfo> Items { get; init; }
+    public List<string>? RegisteredAliases { get; init; }
 }
 
 /// <summary>
