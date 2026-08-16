@@ -10,7 +10,7 @@ namespace DecompilerServer.Services;
 /// Handles C# decompilation with caching and provides source document management.
 /// Caches decompiled source with line indexing for efficient slicing.
 /// </summary>
-public class DecompilerService
+public class DecompilerService : IDisposable
 {
     private readonly AssemblyContextManager _contextManager;
     private readonly MemberResolver _memberResolver;
@@ -21,6 +21,7 @@ public class DecompilerService
     private readonly object _cacheLock = new();
     private readonly object _decompileLock = new();
     private long _cacheVersion = -1;
+    private bool _disposed;
 
     public DecompilerService(AssemblyContextManager contextManager, MemberResolver memberResolver)
     {
@@ -157,6 +158,26 @@ public class DecompilerService
             _contentCache.Values.Count(content => content.SourceKind == SourceKinds.Decompiled),
             _contentCache.Values.Count(content => content.SourceKind != SourceKinds.Decompiled),
             _contentCache.Values.Count(content => content.SourceKind == SourceKinds.SourceLink));
+    }
+
+    internal bool IsDisposed => _disposed;
+
+    public void Dispose()
+    {
+        if (_disposed)
+            return;
+
+        lock (_cacheLock)
+        {
+            if (_disposed)
+                return;
+
+            _contentCache.Clear();
+            _preparedSourceCache.Clear();
+            _memberContentKeyCache.Clear();
+            _originalSourceResolver.Dispose();
+            _disposed = true;
+        }
     }
 
     private string GetOrCreateContentKey(string memberId, IEntity entity)

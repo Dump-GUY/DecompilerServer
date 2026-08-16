@@ -20,95 +20,105 @@ public static class BatchGetDecompiledSourceTool
             var results = new List<object>();
             var totalChars = 0;
             var truncated = false;
+            var retainedSessions = new List<ToolSessionView>();
 
-            foreach (var memberId in memberIds)
+            try
             {
-                try
+                foreach (var memberId in memberIds)
                 {
-                    using var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
-                    var contextManager = session.ContextManager;
-                    var decompilerService = session.DecompilerService;
-                    var memberResolver = session.MemberResolver;
-
-                    if (!contextManager.IsLoaded)
+                    try
                     {
-                        throw new InvalidOperationException("No assembly loaded");
-                    }
+                        var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
+                        retainedSessions.Add(session);
+                        var contextManager = session.ContextManager;
+                        var decompilerService = session.DecompilerService;
+                        var memberResolver = session.MemberResolver;
 
-                    _ = ToolValidation.ResolveMemberOrThrow(session, memberId);
-
-                    var document = decompilerService.DecompileMember(memberId, includeHeader: true);
-
-                    // Create first slice (typically the whole document or a reasonable portion)
-                    var firstSlice = decompilerService.GetSourceSlice(memberId, 1, Math.Min(document.TotalLines, 50));
-                    var sliceLength = firstSlice.Code.Length;
-
-                    // Check if adding this would exceed the limit
-                    if (totalChars + sliceLength > maxTotalChars)
-                    {
-                        truncated = true;
-                        break;
-                    }
-
-                    totalChars += sliceLength;
-
-                    results.Add(new
-                    {
-                        doc = new
+                        if (!contextManager.IsLoaded)
                         {
-                            memberId = document.MemberId,
-                            language = document.Language,
-                            totalLines = document.TotalLines,
-                            hash = document.Hash,
-                            includeHeader = document.IncludeHeader
-                        },
-                        firstSlice = new
-                        {
-                            memberId = firstSlice.MemberId,
-                            language = firstSlice.Language,
-                            startLine = firstSlice.StartLine,
-                            endLine = firstSlice.EndLine,
-                            totalLines = firstSlice.TotalLines,
-                            hash = firstSlice.Hash,
-                            code = firstSlice.Code
+                            throw new InvalidOperationException("No assembly loaded");
                         }
-                    });
+
+                        _ = ToolValidation.ResolveMemberOrThrow(session, memberId);
+
+                        var document = decompilerService.DecompileMember(memberId, includeHeader: true);
+
+                        // Create first slice (typically the whole document or a reasonable portion)
+                        var firstSlice = decompilerService.GetSourceSlice(memberId, 1, Math.Min(document.TotalLines, 50));
+                        var sliceLength = firstSlice.Code.Length;
+
+                        // Check if adding this would exceed the limit
+                        if (totalChars + sliceLength > maxTotalChars)
+                        {
+                            truncated = true;
+                            break;
+                        }
+
+                        totalChars += sliceLength;
+
+                        results.Add(new
+                        {
+                            doc = new
+                            {
+                                memberId = document.MemberId,
+                                language = document.Language,
+                                totalLines = document.TotalLines,
+                                hash = document.Hash,
+                                includeHeader = document.IncludeHeader
+                            },
+                            firstSlice = new
+                            {
+                                memberId = firstSlice.MemberId,
+                                language = firstSlice.Language,
+                                startLine = firstSlice.StartLine,
+                                endLine = firstSlice.EndLine,
+                                totalLines = firstSlice.TotalLines,
+                                hash = firstSlice.Hash,
+                                code = firstSlice.Code
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        // Add error entry for failed decompilation
+                        results.Add(new
+                        {
+                            doc = new
+                            {
+                                memberId = memberId,
+                                language = "C#",
+                                totalLines = 1,
+                                hash = "error",
+                                includeHeader = true
+                            },
+                            firstSlice = new
+                            {
+                                memberId = memberId,
+                                language = "C#",
+                                startLine = 1,
+                                endLine = 1,
+                                totalLines = 1,
+                                hash = "error",
+                                code = $"// Error decompiling {memberId}: {ex.Message}"
+                            }
+                        });
+                    }
                 }
-                catch (Exception ex)
+
+                return new
                 {
-                    // Add error entry for failed decompilation
-                    results.Add(new
-                    {
-                        doc = new
-                        {
-                            memberId = memberId,
-                            language = "C#",
-                            totalLines = 1,
-                            hash = "error",
-                            includeHeader = true
-                        },
-                        firstSlice = new
-                        {
-                            memberId = memberId,
-                            language = "C#",
-                            startLine = 1,
-                            endLine = 1,
-                            totalLines = 1,
-                            hash = "error",
-                            code = $"// Error decompiling {memberId}: {ex.Message}"
-                        }
-                    });
-                }
+                    items = results,
+                    totalCharacters = totalChars,
+                    truncated = truncated,
+                    processed = results.Count,
+                    requested = memberIds.Length
+                };
             }
-
-            return new
+            finally
             {
-                items = results,
-                totalCharacters = totalChars,
-                truncated = truncated,
-                processed = results.Count,
-                requested = memberIds.Length
-            };
+                for (var index = retainedSessions.Count - 1; index >= 0; index--)
+                    retainedSessions[index].Dispose();
+            }
         });
     }
 }

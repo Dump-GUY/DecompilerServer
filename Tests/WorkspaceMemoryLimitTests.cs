@@ -40,6 +40,7 @@ public sealed class WorkspaceMemoryLimitTests : IDisposable
         Assert.Equal(["first", "third"], LoadedAliases(workspace));
         Assert.Equal(["first", "second", "third"], workspace.ListRegisteredAliases());
         Assert.False(secondSession.ContextManager.IsLoaded);
+        Assert.True(secondSession.DecompilerService.IsDisposed);
         Assert.Equal(1, workspace.GetMemoryStats().Evictions);
 
         using var reloadedSecond = workspace.AcquireSession("second");
@@ -172,6 +173,52 @@ public sealed class WorkspaceMemoryLimitTests : IDisposable
     }
 
     [Fact]
+    public void RegistryPersistenceFailure_RestoresDisplacedResidentAndLeavesRegistryUnchanged()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        DecompilerSession displacedSession;
+        using (var firstLease = workspace.AcquireSession("first"))
+        {
+            displacedSession = firstLease.Session;
+            var settings = displacedSession.ContextManager.GetSettings();
+            settings.UsingDeclarations = false;
+            displacedSession.ContextManager.UpdateSettings(settings);
+        }
+
+        using (workspace.AcquireSession("second"))
+        {
+            // Keep first as the LRU victim while retaining its identity for the assertion.
+        }
+
+        File.Delete(_registryPath);
+        Directory.CreateDirectory(_registryPath);
+
+        var exception = Record.Exception(() =>
+            Load(workspace, "replacement", NestedAssemblyPath, makeCurrent: true));
+
+        Assert.NotNull(exception);
+        Assert.True(exception is IOException or UnauthorizedAccessException, exception.ToString());
+        Assert.False(displacedSession.ContextManager.IsLoaded);
+        Assert.True(displacedSession.DecompilerService.IsDisposed);
+        Assert.Equal(["first", "second"], LoadedAliases(workspace));
+        Assert.Equal(["first", "second"], workspace.ListRegisteredAliases());
+        Assert.Equal("first", workspace.CurrentContextAlias);
+        Assert.DoesNotContain("replacement", workspace.ListRegisteredAliases());
+
+        using var restoredLease = workspace.AcquireSession("first");
+        Assert.NotSame(displacedSession, restoredLease.Session);
+        Assert.False(restoredLease.Session.ContextManager.GetSettings().UsingDeclarations);
+
+        var memory = workspace.GetMemoryStats();
+        Assert.Equal(2, memory.LoadedContexts);
+        Assert.Equal(1, memory.Evictions);
+        Assert.Equal(1, memory.Reloads);
+    }
+
+    [Fact]
     public async Task ConcurrentLease_PreventsEvictionUntilTheUsingCallCompletes()
     {
         using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
@@ -272,6 +319,44 @@ public sealed class WorkspaceMemoryLimitTests : IDisposable
         Assert.Equal(2, memory.GetProperty("maxLoadedContexts").GetInt32());
         Assert.Equal(2, memory.GetProperty("loadedContexts").GetInt32());
         Assert.Equal(0, memory.GetProperty("activeLeases").GetInt32());
+    }
+
+    [Fact]
+    public void BatchGetDecompiledSource_HoldsEarlierContextLeaseUntilBatchCompletes()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 1);
+        using var serviceProvider = CreateServiceProvider(workspace);
+        ServiceLocator.SetServiceProvider(serviceProvider);
+
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        string firstMemberId;
+        using (var firstLease = workspace.AcquireSession("first"))
+        {
+            var firstType = firstLease.Session.ContextManager.GetAllTypes()
+                .First(type => type.FullName == "TestLibrary.SimpleClass");
+            firstMemberId = firstLease.Session.MemberResolver.GenerateMemberId(firstType);
+        }
+
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+        string secondMemberId;
+        using (var secondLease = workspace.AcquireSession("second"))
+        {
+            var secondType = secondLease.Session.ContextManager.GetAllTypes()
+                .First(type => type.FullName == "EmbeddedSourceTestLibrary.EmbeddedSourceSample");
+            secondMemberId = secondLease.Session.MemberResolver.GenerateMemberId(secondType);
+        }
+
+        var result = BatchGetDecompiledSourceTool.BatchGetDecompiledSource(
+            [firstMemberId, secondMemberId],
+            maxTotalChars: 50_000);
+        var response = JsonSerializer.Deserialize<JsonElement>(result);
+
+        Assert.Equal("ok", response.GetProperty("status").GetString());
+        var items = response.GetProperty("data").GetProperty("items");
+        Assert.NotEqual("error", items[0].GetProperty("doc").GetProperty("hash").GetString());
+        Assert.Equal("error", items[1].GetProperty("doc").GetProperty("hash").GetString());
+        Assert.Equal(["first"], LoadedAliases(workspace));
+        Assert.Equal(0, workspace.GetMemoryStats().ActiveLeases);
     }
 
     [Fact]

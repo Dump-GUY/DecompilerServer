@@ -493,6 +493,7 @@ public sealed class DecompilerWorkspace : IDisposable
         PreflightLoadRequest(request);
 
         DisplacedSessionState? displacedSession = null;
+        DecompilerSession? sessionToDispose = null;
         DecompilerSettings? settingsToRestore = null;
 
         _lock.EnterWriteLock();
@@ -502,6 +503,7 @@ public sealed class DecompilerWorkspace : IDisposable
             {
                 EnsureNotLeased(existingState, contextAlias);
                 displacedSession = CaptureDisplacedSessionLocked(existingState, wasLruEviction: false);
+                sessionToDispose = existingState.Session;
                 _sessionsByAlias.Remove(contextAlias);
             }
             else if (_sessionsByAlias.Count >= MaxLoadedContexts)
@@ -517,6 +519,7 @@ public sealed class DecompilerWorkspace : IDisposable
 
                 var evictedAlias = evictionCandidate.Session.ContextAlias;
                 displacedSession = CaptureDisplacedSessionLocked(evictionCandidate, wasLruEviction: true);
+                sessionToDispose = evictionCandidate.Session;
                 _settingsByAlias[evictedAlias] = displacedSession.Settings;
                 _sessionsByAlias.Remove(evictedAlias);
                 _evictedAliases.Add(evictedAlias);
@@ -533,7 +536,8 @@ public sealed class DecompilerWorkspace : IDisposable
             _lock.ExitWriteLock();
         }
 
-        displacedSession?.Session.Dispose();
+        sessionToDispose?.Dispose();
+        sessionToDispose = null;
 
         DecompilerSession? createdSession = null;
         try
@@ -544,57 +548,78 @@ public sealed class DecompilerWorkspace : IDisposable
         }
         catch (Exception loadException)
         {
-            createdSession?.Dispose();
-            try
-            {
-                RestoreDisplacedSession(displacedSession);
-            }
-            catch (Exception restoreException)
-            {
-                loadException.Data["displacedContextRestoreError"] = restoreException.Message;
-            }
-
+            RollBackFailedLoad(loadException, createdSession, displacedSession);
             throw;
         }
 
         var session = createdSession!;
+        var activationRequest = CreateActivationRequest(contextAlias, request);
         var sessionOwnedByWorkspace = false;
         try
         {
             _lock.EnterWriteLock();
             try
             {
+                var nextCurrentContextAlias = request.MakeCurrent || CurrentContextAlias == null
+                    ? contextAlias
+                    : CurrentContextAlias;
+                var contextInfo = session.ToContextInfo(isCurrent: string.Equals(
+                    nextCurrentContextAlias,
+                    contextAlias,
+                    StringComparison.OrdinalIgnoreCase));
+                WorkspaceRegistryState? persistedRegistryState = null;
+                if (request.PersistRegistration)
+                {
+                    persistedRegistryState = CreateRegistryStateWithEntry(
+                        contextAlias,
+                        request,
+                        nextCurrentContextAlias);
+                    SaveRegistryState(persistedRegistryState);
+                }
+
                 _sessionsByAlias[contextAlias] = new LoadedSessionState(session, ++_accessSequence);
                 sessionOwnedByWorkspace = true;
                 UpdateAliasRoutingLocked(session);
-                _loadRequestsByAlias[contextAlias] = CreateActivationRequest(contextAlias, request);
+                _loadRequestsByAlias[contextAlias] = activationRequest;
 
                 if (restoreRuntimeSettings && _evictedAliases.Remove(contextAlias))
                     _reloadCount++;
                 else if (!restoreRuntimeSettings)
                     _evictedAliases.Remove(contextAlias);
 
-                if (request.MakeCurrent || CurrentContextAlias == null)
-                    CurrentContextAlias = contextAlias;
+                CurrentContextAlias = nextCurrentContextAlias;
 
-                if (request.PersistRegistration)
-                {
-                    UpsertRegistryEntry(contextAlias, request);
-                    SaveRegistryState();
-                }
+                if (persistedRegistryState != null)
+                    _registryState = persistedRegistryState;
 
-                return session.ToContextInfo(isCurrent: string.Equals(CurrentContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
+                return contextInfo;
             }
             finally
             {
                 _lock.ExitWriteLock();
             }
         }
-        catch
+        catch (Exception loadException)
         {
             if (!sessionOwnedByWorkspace)
-                session.Dispose();
+                RollBackFailedLoad(loadException, session, displacedSession);
             throw;
+        }
+    }
+
+    private void RollBackFailedLoad(
+        Exception loadException,
+        DecompilerSession? createdSession,
+        DisplacedSessionState? displacedSession)
+    {
+        createdSession?.Dispose();
+        try
+        {
+            RestoreDisplacedSession(displacedSession);
+        }
+        catch (Exception restoreException)
+        {
+            loadException.Data["displacedContextRestoreError"] = restoreException.Message;
         }
     }
 
@@ -625,7 +650,7 @@ public sealed class DecompilerWorkspace : IDisposable
             throw new InvalidOperationException($"Loaded context '{contextAlias}' has no activation request for rollback.");
 
         return new DisplacedSessionState(
-            state.Session,
+            contextAlias,
             loadRequest,
             state.Session.ContextManager.GetSettings(),
             state.LastUsedSequence,
@@ -637,7 +662,7 @@ public sealed class DecompilerWorkspace : IDisposable
         if (displacedSession == null)
             return;
 
-        var contextAlias = displacedSession.Session.ContextAlias;
+        var contextAlias = displacedSession.ContextAlias;
         var restoredSession = _sessionFactory(contextAlias, displacedSession.LoadRequest);
         var sessionOwnedByWorkspace = false;
         try
@@ -771,10 +796,15 @@ public sealed class DecompilerWorkspace : IDisposable
         };
     }
 
-    private void UpsertRegistryEntry(string contextAlias, WorkspaceLoadRequest request)
+    private WorkspaceRegistryState CreateRegistryStateWithEntry(
+        string contextAlias,
+        WorkspaceLoadRequest request,
+        string? currentContextAlias)
     {
-        _registryState.Contexts.RemoveAll(entry => string.Equals(entry.ContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
-        _registryState.Contexts.Add(new WorkspaceRegistryEntry
+        var contexts = _registryState.Contexts
+            .Where(entry => !string.Equals(entry.ContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        contexts.Add(new WorkspaceRegistryEntry
         {
             ContextAlias = contextAlias,
             GameDir = request.GameDir,
@@ -783,18 +813,27 @@ public sealed class DecompilerWorkspace : IDisposable
             AdditionalSearchDirs = request.AdditionalSearchDirs,
             RebuildIndex = request.RebuildIndex
         });
-        _registryState.CurrentContextAlias = CurrentContextAlias;
+
+        return new WorkspaceRegistryState
+        {
+            CurrentContextAlias = currentContextAlias,
+            Contexts = contexts
+        };
     }
 
     private void SaveRegistryState()
     {
         _registryState.CurrentContextAlias = CurrentContextAlias;
+        SaveRegistryState(_registryState);
+    }
 
+    private void SaveRegistryState(WorkspaceRegistryState registryState)
+    {
         var directory = Path.GetDirectoryName(_registryPath);
         if (!string.IsNullOrWhiteSpace(directory))
             Directory.CreateDirectory(directory);
 
-        var json = JsonSerializer.Serialize(_registryState, RegistrySerializerOptions);
+        var json = JsonSerializer.Serialize(registryState, RegistrySerializerOptions);
         File.WriteAllText(_registryPath, json);
     }
 
@@ -881,7 +920,7 @@ public sealed class DecompilerWorkspace : IDisposable
     }
 
     private sealed record DisplacedSessionState(
-        DecompilerSession Session,
+        string ContextAlias,
         WorkspaceLoadRequest LoadRequest,
         DecompilerSettings Settings,
         long LastUsedSequence,
@@ -990,8 +1029,17 @@ public sealed class DecompilerSession : IDisposable
         if (_disposed)
             return;
 
-        ContextManager.Dispose();
-        _disposed = true;
+        try
+        {
+            DecompilerService.Dispose();
+            MemberResolver.ClearCache();
+            UsageAnalyzer.ClearCache();
+        }
+        finally
+        {
+            ContextManager.Dispose();
+            _disposed = true;
+        }
     }
 }
 

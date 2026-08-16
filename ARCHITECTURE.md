@@ -57,6 +57,7 @@ A session bundles:
 - `InheritanceAnalyzer`
 
 Sessions are isolated per loaded assembly so caches and member resolution stay version-specific.
+Disposing a session eagerly clears its source, member-resolution, usage, and string-literal caches, disposes original-source and PDB resources, and then disposes the assembly context.
 
 Tool calls acquire a `DecompilerSessionLease` for every routed session and hold it for the entire operation. A leased session cannot be replaced, explicitly unloaded, or selected as an LRU victim. This is required because MCP tools may execute concurrently and compare tools hold two sessions at once.
 
@@ -186,6 +187,7 @@ Eviction behavior:
 - replacement inputs pass a lightweight PE/metadata preflight before any resident session is displaced;
 - the oldest unleased session is disposed before a replacement is created, so the resident count never crosses the configured limit;
 - if full session construction still fails, the displaced context is immediately rebuilt from its activation request and settings without crossing the limit;
+- persistent loads write the prospective registry state before committing the resident swap; a persistence failure disposes the replacement and rebuilds the displaced context;
 - current selection does not pin a session and may point to a registered but currently unloaded alias;
 - runtime MVID routing remains available after eviction, while the documented post-restart limitation still applies;
 - comparisons acquire both context leases for their full operation;
