@@ -366,7 +366,7 @@ public class AssemblyContextManager : IDisposable
         }
     }
 
-    private string ResolveAssemblyPath(string gameDir, string assemblyFile)
+    internal static string ResolveAssemblyPath(string gameDir, string assemblyFile)
     {
         // If absolute path provided, use it
         if (Path.IsPathRooted(assemblyFile))

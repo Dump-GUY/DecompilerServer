@@ -87,6 +87,91 @@ public sealed class WorkspaceMemoryLimitTests : IDisposable
     }
 
     [Fact]
+    public void InvalidReplacement_PreflightLeavesLruSessionUntouched()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        DecompilerSession firstSession;
+        using (var firstLease = workspace.AcquireSession("first"))
+        {
+            firstSession = firstLease.Session;
+        }
+
+        using (workspace.AcquireSession("second"))
+        {
+            // Keep first as the LRU candidate while retaining its identity for the assertion.
+        }
+
+        var missingPath = Path.Combine(_tempDir, "missing.dll");
+        Assert.Throws<FileNotFoundException>(() =>
+            Load(workspace, "missing", missingPath, makeCurrent: false));
+
+        var corruptPath = Path.Combine(_tempDir, "corrupt.dll");
+        File.WriteAllText(corruptPath, "not a managed assembly");
+        Assert.Throws<BadImageFormatException>(() =>
+            Load(workspace, "corrupt", corruptPath, makeCurrent: false));
+
+        using var unchangedFirstLease = workspace.AcquireSession("first");
+        Assert.Same(firstSession, unchangedFirstLease.Session);
+        Assert.True(firstSession.ContextManager.IsLoaded);
+        Assert.Equal(["first", "second"], LoadedAliases(workspace));
+        Assert.Equal(0, workspace.GetMemoryStats().Evictions);
+        Assert.DoesNotContain("missing", workspace.ListRegisteredAliases());
+        Assert.DoesNotContain("corrupt", workspace.ListRegisteredAliases());
+    }
+
+    [Fact]
+    public void PostPreflightLoadFailure_RestoresDisplacedLruAndCurrentAlias()
+    {
+        DecompilerSession CreateSession(string contextAlias, WorkspaceLoadRequest request)
+        {
+            if (string.Equals(contextAlias, "replacement", StringComparison.Ordinal))
+                throw new InvalidOperationException("Injected session construction failure.");
+
+            return DecompilerSession.Create(contextAlias, request);
+        }
+
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2, sessionFactory: CreateSession);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        DecompilerSession displacedSession;
+        using (var firstLease = workspace.AcquireSession("first"))
+        {
+            displacedSession = firstLease.Session;
+            var settings = displacedSession.ContextManager.GetSettings();
+            settings.UsingDeclarations = false;
+            displacedSession.ContextManager.UpdateSettings(settings);
+        }
+
+        using (workspace.AcquireSession("second"))
+        {
+            // Make first the LRU victim before injecting the post-preflight failure.
+        }
+
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            Load(workspace, "replacement", NestedAssemblyPath, makeCurrent: true));
+
+        Assert.Equal("Injected session construction failure.", exception.Message);
+        Assert.False(displacedSession.ContextManager.IsLoaded);
+        Assert.Equal(["first", "second"], LoadedAliases(workspace));
+        Assert.Equal("first", workspace.CurrentContextAlias);
+        Assert.DoesNotContain("replacement", workspace.ListRegisteredAliases());
+
+        using var restoredLease = workspace.AcquireSession("first");
+        Assert.NotSame(displacedSession, restoredLease.Session);
+        Assert.True(restoredLease.Session.ContextManager.IsLoaded);
+        Assert.False(restoredLease.Session.ContextManager.GetSettings().UsingDeclarations);
+
+        var memory = workspace.GetMemoryStats();
+        Assert.Equal(2, memory.LoadedContexts);
+        Assert.Equal(1, memory.Evictions);
+        Assert.Equal(1, memory.Reloads);
+    }
+
+    [Fact]
     public async Task ConcurrentLease_PreventsEvictionUntilTheUsingCallCompletes()
     {
         using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);

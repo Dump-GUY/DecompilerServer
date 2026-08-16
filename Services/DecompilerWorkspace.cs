@@ -1,5 +1,7 @@
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using ICSharpCode.Decompiler;
 
 namespace DecompilerServer.Services;
@@ -23,6 +25,7 @@ public sealed class DecompilerWorkspace : IDisposable
     private readonly Dictionary<string, WorkspaceLoadRequest> _loadRequestsByAlias = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DecompilerSettings> _settingsByAlias = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _evictedAliases = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Func<string, WorkspaceLoadRequest, DecompilerSession> _sessionFactory;
     private readonly string _registryPath;
     private WorkspaceRegistryState _registryState;
     private long _accessSequence;
@@ -34,7 +37,16 @@ public sealed class DecompilerWorkspace : IDisposable
     public int MaxLoadedContexts { get; }
 
     public DecompilerWorkspace(string? registryPath = null, int? maxLoadedContexts = null)
+        : this(registryPath, maxLoadedContexts, DecompilerSession.Create)
     {
+    }
+
+    internal DecompilerWorkspace(
+        string? registryPath,
+        int? maxLoadedContexts,
+        Func<string, WorkspaceLoadRequest, DecompilerSession> sessionFactory)
+    {
+        _sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         MaxLoadedContexts = maxLoadedContexts ?? ReadMaxLoadedContextsFromEnvironment();
         if (MaxLoadedContexts <= 0)
             throw new ArgumentOutOfRangeException(nameof(maxLoadedContexts), "The loaded context limit must be greater than zero.");
@@ -478,7 +490,9 @@ public sealed class DecompilerWorkspace : IDisposable
     private WorkspaceContextInfo LoadAssemblyCore(WorkspaceLoadRequest request, bool restoreRuntimeSettings)
     {
         var contextAlias = NormalizeAlias(request.ContextAlias);
-        DecompilerSession? sessionToDispose = null;
+        PreflightLoadRequest(request);
+
+        DisplacedSessionState? displacedSession = null;
         DecompilerSettings? settingsToRestore = null;
 
         _lock.EnterWriteLock();
@@ -487,8 +501,8 @@ public sealed class DecompilerWorkspace : IDisposable
             if (_sessionsByAlias.TryGetValue(contextAlias, out var existingState))
             {
                 EnsureNotLeased(existingState, contextAlias);
+                displacedSession = CaptureDisplacedSessionLocked(existingState, wasLruEviction: false);
                 _sessionsByAlias.Remove(contextAlias);
-                sessionToDispose = existingState.Session;
             }
             else if (_sessionsByAlias.Count >= MaxLoadedContexts)
             {
@@ -502,11 +516,11 @@ public sealed class DecompilerWorkspace : IDisposable
                     throw CreateCapacityBusyError();
 
                 var evictedAlias = evictionCandidate.Session.ContextAlias;
-                _settingsByAlias[evictedAlias] = evictionCandidate.Session.ContextManager.GetSettings();
+                displacedSession = CaptureDisplacedSessionLocked(evictionCandidate, wasLruEviction: true);
+                _settingsByAlias[evictedAlias] = displacedSession.Settings;
                 _sessionsByAlias.Remove(evictedAlias);
                 _evictedAliases.Add(evictedAlias);
                 _evictionCount++;
-                sessionToDispose = evictionCandidate.Session;
             }
 
             if (restoreRuntimeSettings)
@@ -519,15 +533,34 @@ public sealed class DecompilerWorkspace : IDisposable
             _lock.ExitWriteLock();
         }
 
-        sessionToDispose?.Dispose();
+        displacedSession?.Session.Dispose();
 
-        var session = DecompilerSession.Create(contextAlias, request);
+        DecompilerSession? createdSession = null;
+        try
+        {
+            createdSession = _sessionFactory(contextAlias, request);
+            if (settingsToRestore != null)
+                createdSession.ContextManager.UpdateSettings(settingsToRestore);
+        }
+        catch (Exception loadException)
+        {
+            createdSession?.Dispose();
+            try
+            {
+                RestoreDisplacedSession(displacedSession);
+            }
+            catch (Exception restoreException)
+            {
+                loadException.Data["displacedContextRestoreError"] = restoreException.Message;
+            }
+
+            throw;
+        }
+
+        var session = createdSession!;
         var sessionOwnedByWorkspace = false;
         try
         {
-            if (settingsToRestore != null)
-                session.ContextManager.UpdateSettings(settingsToRestore);
-
             _lock.EnterWriteLock();
             try
             {
@@ -562,6 +595,79 @@ public sealed class DecompilerWorkspace : IDisposable
             if (!sessionOwnedByWorkspace)
                 session.Dispose();
             throw;
+        }
+    }
+
+    private static void PreflightLoadRequest(WorkspaceLoadRequest request)
+    {
+        var assemblyPath = request.AssemblyPath
+            ?? AssemblyContextManager.ResolveAssemblyPath(request.GameDir!, request.AssemblyFile);
+
+        if (!File.Exists(assemblyPath))
+            throw new FileNotFoundException($"Assembly not found: {assemblyPath}");
+
+        using var stream = new FileStream(
+            assemblyPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var peReader = new PEReader(stream, PEStreamOptions.LeaveOpen);
+        if (!peReader.HasMetadata)
+            throw new BadImageFormatException($"File does not contain managed metadata: {assemblyPath}");
+
+        _ = peReader.GetMetadataReader().GetModuleDefinition();
+    }
+
+    private DisplacedSessionState CaptureDisplacedSessionLocked(LoadedSessionState state, bool wasLruEviction)
+    {
+        var contextAlias = state.Session.ContextAlias;
+        if (!_loadRequestsByAlias.TryGetValue(contextAlias, out var loadRequest))
+            throw new InvalidOperationException($"Loaded context '{contextAlias}' has no activation request for rollback.");
+
+        return new DisplacedSessionState(
+            state.Session,
+            loadRequest,
+            state.Session.ContextManager.GetSettings(),
+            state.LastUsedSequence,
+            wasLruEviction);
+    }
+
+    private void RestoreDisplacedSession(DisplacedSessionState? displacedSession)
+    {
+        if (displacedSession == null)
+            return;
+
+        var contextAlias = displacedSession.Session.ContextAlias;
+        var restoredSession = _sessionFactory(contextAlias, displacedSession.LoadRequest);
+        var sessionOwnedByWorkspace = false;
+        try
+        {
+            restoredSession.ContextManager.UpdateSettings(displacedSession.Settings);
+
+            _lock.EnterWriteLock();
+            try
+            {
+                if (_sessionsByAlias.Count >= MaxLoadedContexts)
+                    throw new InvalidOperationException("The displaced context cannot be restored without exceeding the loaded context limit.");
+
+                _sessionsByAlias[contextAlias] = new LoadedSessionState(restoredSession, displacedSession.LastUsedSequence);
+                sessionOwnedByWorkspace = true;
+                UpdateAliasRoutingLocked(restoredSession);
+                _loadRequestsByAlias[contextAlias] = displacedSession.LoadRequest;
+                _settingsByAlias[contextAlias] = displacedSession.Settings;
+
+                if (displacedSession.WasLruEviction && _evictedAliases.Remove(contextAlias))
+                    _reloadCount++;
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
+        }
+        finally
+        {
+            if (!sessionOwnedByWorkspace)
+                restoredSession.Dispose();
         }
     }
 
@@ -773,6 +879,13 @@ public sealed class DecompilerWorkspace : IDisposable
         public long LastUsedSequence { get; set; } = lastUsedSequence;
         public int ActiveLeaseCount { get; set; }
     }
+
+    private sealed record DisplacedSessionState(
+        DecompilerSession Session,
+        WorkspaceLoadRequest LoadRequest,
+        DecompilerSettings Settings,
+        long LastUsedSequence,
+        bool WasLruEviction);
 }
 
 public sealed class DecompilerSessionLease : IDisposable

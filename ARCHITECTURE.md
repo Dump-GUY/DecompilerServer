@@ -183,7 +183,9 @@ Startup behavior:
 
 Eviction behavior:
 - use and lease completion update recency;
+- replacement inputs pass a lightweight PE/metadata preflight before any resident session is displaced;
 - the oldest unleased session is disposed before a replacement is created, so the resident count never crosses the configured limit;
+- if full session construction still fails, the displaced context is immediately rebuilt from its activation request and settings without crossing the limit;
 - current selection does not pin a session and may point to a registered but currently unloaded alias;
 - runtime MVID routing remains available after eviction, while the documented post-restart limitation still applies;
 - comparisons acquire both context leases for their full operation;
