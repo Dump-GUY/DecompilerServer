@@ -14,7 +14,7 @@ public static class WarmIndexTool
         return ResponseFormatter.TryExecute(() =>
         {
             var stopwatch = Stopwatch.StartNew();
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var built = new List<string>();
 

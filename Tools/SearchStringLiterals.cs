@@ -12,7 +12,7 @@ public static class SearchStringLiteralsTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var usageAnalyzer = session.UsageAnalyzer;
 

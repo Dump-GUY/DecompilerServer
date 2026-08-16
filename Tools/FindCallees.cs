@@ -12,7 +12,7 @@ public static class FindCalleesTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(methodId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(methodId, contextAlias);
             var contextManager = session.ContextManager;
             var usageAnalyzer = session.UsageAnalyzer;
 

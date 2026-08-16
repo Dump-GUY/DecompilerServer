@@ -14,7 +14,7 @@ public static class SetDecompileSettingsTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var decompilerService = session.DecompilerService;
 

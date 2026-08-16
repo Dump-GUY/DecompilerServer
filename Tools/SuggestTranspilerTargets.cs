@@ -14,7 +14,7 @@ public static class SuggestTranspilerTargetsTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
             var contextManager = session.ContextManager;
             var memberResolver = session.MemberResolver;
 

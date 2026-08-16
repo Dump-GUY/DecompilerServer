@@ -14,7 +14,7 @@ public static class NormalizeMemberIdTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var memberResolver = session.MemberResolver;
 

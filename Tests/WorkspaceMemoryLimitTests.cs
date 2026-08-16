@@ -1,0 +1,257 @@
+using System.Text.Json;
+using DecompilerServer;
+using DecompilerServer.Services;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace Tests;
+
+public sealed class WorkspaceMemoryLimitTests : IDisposable
+{
+    private readonly string _tempDir;
+    private readonly string _registryPath;
+
+    public WorkspaceMemoryLimitTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"WorkspaceMemoryLimitTests_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+        _registryPath = Path.Combine(_tempDir, "contexts.json");
+    }
+
+    [Fact]
+    public void LoadingBeyondLimit_EvictsLeastRecentlyUsedIdleContext_AndReloadsItOnDemand()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        DecompilerSession secondSession;
+        using (var secondLease = workspace.AcquireSession("second"))
+        {
+            secondSession = secondLease.Session;
+        }
+
+        using (workspace.AcquireSession("first"))
+        {
+            // Touch first so second is the least recently used context.
+        }
+
+        Load(workspace, "third", NestedAssemblyPath, makeCurrent: false);
+
+        Assert.Equal(["first", "third"], LoadedAliases(workspace));
+        Assert.Equal(["first", "second", "third"], workspace.ListRegisteredAliases());
+        Assert.False(secondSession.ContextManager.IsLoaded);
+        Assert.Equal(1, workspace.GetMemoryStats().Evictions);
+
+        using var reloadedSecond = workspace.AcquireSession("second");
+
+        Assert.Equal("second", reloadedSecond.Session.ContextAlias);
+        Assert.True(reloadedSecond.Session.ContextManager.IsLoaded);
+        Assert.Equal(["second", "third"], LoadedAliases(workspace));
+        Assert.Equal("first", workspace.CurrentContextAlias);
+
+        var memory = workspace.GetMemoryStats();
+        Assert.Equal(2, memory.MaxLoadedContexts);
+        Assert.Equal(2, memory.LoadedContexts);
+        Assert.Equal(2, memory.Evictions);
+        Assert.Equal(1, memory.Reloads);
+    }
+
+    [Fact]
+    public void LoadingAtCapacity_NeverEvictsLeasedContexts_AndReturnsStructuredBusyError()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        using var firstLease = workspace.AcquireSession("first");
+        var unloadException = Assert.Throws<ToolErrorException>(() => workspace.UnloadContext("first"));
+        Assert.Equal("context_busy", unloadException.Code);
+
+        Load(workspace, "third", NestedAssemblyPath, makeCurrent: false);
+
+        Assert.True(firstLease.Session.ContextManager.IsLoaded);
+        Assert.Equal(["first", "third"], LoadedAliases(workspace));
+
+        using var thirdLease = workspace.AcquireSession("third");
+        var exception = Assert.Throws<ToolErrorException>(() =>
+            Load(workspace, "fourth", EmbeddedAssemblyPath, makeCurrent: false));
+
+        Assert.Equal("context_capacity_busy", exception.Code);
+        Assert.Equal(["first", "third"], LoadedAliases(workspace));
+        Assert.DoesNotContain("fourth", workspace.ListRegisteredAliases());
+
+        var memory = workspace.GetMemoryStats();
+        Assert.Equal(2, memory.LoadedContexts);
+        Assert.Equal(2, memory.ActiveLeases);
+        Assert.Equal(["first", "third"], memory.LeasedAliases);
+    }
+
+    [Fact]
+    public async Task ConcurrentLease_PreventsEvictionUntilTheUsingCallCompletes()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        Load(workspace, "first", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "second", EmbeddedAssemblyPath, makeCurrent: false);
+
+        var leaseAcquired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseLease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var activeCall = Task.Run(async () =>
+        {
+            using var lease = workspace.AcquireSession("first");
+            leaseAcquired.SetResult();
+            await releaseLease.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.True(lease.Session.ContextManager.IsLoaded);
+        });
+
+        await leaseAcquired.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Load(workspace, "third", NestedAssemblyPath, makeCurrent: false);
+
+        Assert.Equal(["first", "third"], LoadedAliases(workspace));
+        Assert.Equal(1, workspace.GetMemoryStats().ActiveLeases);
+
+        releaseLease.SetResult();
+        await activeCall.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(0, workspace.GetMemoryStats().ActiveLeases);
+    }
+
+    [Fact]
+    public void MemberIdFromEvictedContext_ReloadsOwningAliasInsteadOfFallingBackToCurrent()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 1);
+        Load(workspace, "owner", TestAssemblyLocator.GetPath(), makeCurrent: true);
+
+        string memberId;
+        using (var ownerLease = workspace.AcquireSession("owner"))
+        {
+            var type = ownerLease.Session.ContextManager.FindTypeByName("TestLibrary.SimpleClass");
+            Assert.NotNull(type);
+            memberId = ownerLease.Session.MemberResolver.GenerateMemberId(type);
+        }
+
+        Load(workspace, "current", EmbeddedAssemblyPath, makeCurrent: true);
+        Assert.Equal(["current"], LoadedAliases(workspace));
+
+        using var routedLease = workspace.AcquireSessionForMemberId(memberId);
+
+        Assert.Equal("owner", routedLease.Session.ContextAlias);
+        Assert.Equal(["owner"], LoadedAliases(workspace));
+        Assert.Equal("current", workspace.CurrentContextAlias);
+        Assert.Equal(2, workspace.GetMemoryStats().Evictions);
+        Assert.Equal(1, workspace.GetMemoryStats().Reloads);
+    }
+
+    [Fact]
+    public void EvictionAndReload_PreservePerContextDecompilerSettings()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 1);
+        Load(workspace, "configured", TestAssemblyLocator.GetPath(), makeCurrent: true);
+
+        using (var configuredLease = workspace.AcquireSession("configured"))
+        {
+            var settings = configuredLease.Session.ContextManager.GetSettings();
+            settings.UsingDeclarations = false;
+            settings.ShowXmlDocumentation = false;
+            configuredLease.Session.ContextManager.UpdateSettings(settings);
+        }
+
+        Load(workspace, "other", EmbeddedAssemblyPath, makeCurrent: true);
+
+        using var reloadedLease = workspace.AcquireSession("configured");
+        var restoredSettings = reloadedLease.Session.ContextManager.GetSettings();
+
+        Assert.False(restoredSettings.UsingDeclarations);
+        Assert.False(restoredSettings.ShowXmlDocumentation);
+    }
+
+    [Fact]
+    public void CompareContexts_AtTwoContextLimit_HoldsBothLeasesForTheOperation()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        using var serviceProvider = CreateServiceProvider(workspace);
+        ServiceLocator.SetServiceProvider(serviceProvider);
+
+        Load(workspace, "left", TestAssemblyLocator.GetPath(), makeCurrent: true);
+        Load(workspace, "right", EmbeddedAssemblyPath, makeCurrent: false);
+
+        var result = CompareContextsTool.CompareContexts("left", "right", limit: 10);
+        var response = JsonSerializer.Deserialize<JsonElement>(result);
+
+        Assert.Equal("ok", response.GetProperty("status").GetString());
+        Assert.Equal(0, workspace.GetMemoryStats().ActiveLeases);
+        Assert.Equal(["left", "right"], LoadedAliases(workspace));
+
+        var statsResult = GetServerStatsTool.GetServerStats("left");
+        var statsResponse = JsonSerializer.Deserialize<JsonElement>(statsResult);
+        var memory = statsResponse.GetProperty("data").GetProperty("memory");
+        Assert.Equal(2, memory.GetProperty("maxLoadedContexts").GetInt32());
+        Assert.Equal(2, memory.GetProperty("loadedContexts").GetInt32());
+        Assert.Equal(0, memory.GetProperty("activeLeases").GetInt32());
+    }
+
+    [Fact]
+    public void RepeatedLoads_KeepResidentContextCountAtHardLimit()
+    {
+        using var workspace = new DecompilerWorkspace(_registryPath, maxLoadedContexts: 2);
+        var paths = new[] { TestAssemblyLocator.GetPath(), EmbeddedAssemblyPath, NestedAssemblyPath };
+
+        for (var index = 0; index < 12; index++)
+        {
+            Load(workspace, $"context-{index}", paths[index % paths.Length], makeCurrent: index == 0);
+            Assert.InRange(workspace.ListContexts().Count, 1, 2);
+        }
+
+        var memory = workspace.GetMemoryStats();
+        Assert.Equal(2, memory.LoadedContexts);
+        Assert.Equal(10, memory.Evictions);
+        Assert.Equal(12, workspace.ListRegisteredAliases().Count);
+    }
+
+    private static string EmbeddedAssemblyPath =>
+        typeof(global::EmbeddedSourceTestLibrary.EmbeddedSourceSample).Assembly.Location;
+
+    private static string NestedAssemblyPath =>
+        typeof(global::NestedNoSymbolsTestLibrary.OuterContainer).Assembly.Location;
+
+    private static void Load(
+        DecompilerWorkspace workspace,
+        string contextAlias,
+        string assemblyPath,
+        bool makeCurrent)
+    {
+        workspace.LoadAssembly(new WorkspaceLoadRequest
+        {
+            AssemblyPath = assemblyPath,
+            ContextAlias = contextAlias,
+            RebuildIndex = false,
+            MakeCurrent = makeCurrent
+        });
+    }
+
+    private static string[] LoadedAliases(DecompilerWorkspace workspace)
+    {
+        return workspace.ListContexts()
+            .Select(context => context.ContextAlias)
+            .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
+    private static ServiceProvider CreateServiceProvider(DecompilerWorkspace workspace)
+    {
+        var services = new ServiceCollection();
+        services.AddSingleton(workspace);
+        services.AddSingleton<AssemblyContextManager>();
+        services.AddSingleton<MemberResolver>();
+        services.AddSingleton<DecompilerService>();
+        services.AddSingleton<UsageAnalyzer>();
+        services.AddSingleton<InheritanceAnalyzer>();
+        services.AddSingleton<ResponseFormatter>();
+        return services.BuildServiceProvider();
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+}

@@ -18,8 +18,8 @@ public static class CompareSymbolsTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var left = ToolSessionRouter.GetForContext(leftContextAlias);
-            var right = ToolSessionRouter.GetForContext(rightContextAlias);
+            using var left = ToolSessionRouter.GetForContext(leftContextAlias);
+            using var right = ToolSessionRouter.GetForContext(rightContextAlias);
 
             var normalizedKind = NormalizeSymbolKind(symbolKind, symbol);
             var normalizedCompareMode = NormalizeCompareMode(compareMode);

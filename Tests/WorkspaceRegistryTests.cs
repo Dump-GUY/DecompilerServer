@@ -69,15 +69,17 @@ public class WorkspaceRegistryTests : IDisposable
         Assert.Equal("rw14", restartedWorkspace.CurrentContextAlias);
         Assert.Equal(["rw14", "rw15"], restartedWorkspace.ListRegisteredAliases());
         Assert.Empty(restartedWorkspace.ListContexts());
-        Assert.False(restartedWorkspace.TryGetCurrentSession(out _));
+        Assert.False(restartedWorkspace.TryAcquireCurrentLoadedSession(out _));
 
-        var rw15 = restartedWorkspace.GetOrLoadSession("rw15");
+        using var rw15Lease = restartedWorkspace.AcquireSession("rw15");
+        var rw15 = rw15Lease.Session;
 
         Assert.Equal("rw15", rw15.ContextAlias);
         Assert.Equal("rw14", restartedWorkspace.CurrentContextAlias);
         Assert.Single(restartedWorkspace.ListContexts());
 
-        var current = restartedWorkspace.GetCurrentSession();
+        using var currentLease = restartedWorkspace.AcquireCurrentSession();
+        var current = currentLease.Session;
 
         Assert.Equal("rw14", current.ContextAlias);
         Assert.Equal(2, restartedWorkspace.ListContexts().Count);
@@ -185,7 +187,8 @@ public class WorkspaceRegistryTests : IDisposable
             MakeCurrent = true
         });
 
-        var primarySession = workspace.GetCurrentSession();
+        using var primaryLease = workspace.AcquireCurrentSession();
+        var primarySession = primaryLease.Session;
         var type = primarySession.ContextManager.FindTypeByName("TestLibrary.SimpleClass");
         Assert.NotNull(type);
         var memberId = primarySession.MemberResolver.GenerateMemberId(type);
@@ -206,12 +209,16 @@ public class WorkspaceRegistryTests : IDisposable
             MakeCurrent = true
         });
 
-        Assert.Equal("primary", workspace.ResolveSessionForMemberId(memberId).ContextAlias);
+        using (var routedLease = workspace.AcquireSessionForMemberId(memberId))
+        {
+            Assert.Equal("primary", routedLease.Session.ContextAlias);
+        }
 
         workspace.UnloadContext("duplicate");
 
         Assert.Equal("other", workspace.CurrentContextAlias);
-        Assert.Equal("primary", workspace.ResolveSessionForMemberId(memberId).ContextAlias);
+        using var reroutedLease = workspace.AcquireSessionForMemberId(memberId);
+        Assert.Equal("primary", reroutedLease.Session.ContextAlias);
     }
 
     public void Dispose()

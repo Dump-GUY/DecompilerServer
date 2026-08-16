@@ -8,7 +8,11 @@ internal sealed record ToolSessionView(
     MemberResolver MemberResolver,
     DecompilerService DecompilerService,
     UsageAnalyzer UsageAnalyzer,
-    InheritanceAnalyzer InheritanceAnalyzer);
+    InheritanceAnalyzer InheritanceAnalyzer,
+    DecompilerSessionLease? Lease = null) : IDisposable
+{
+    public void Dispose() => Lease?.Dispose();
+}
 
 internal static class ToolSessionRouter
 {
@@ -17,17 +21,17 @@ internal static class ToolSessionRouter
         var workspace = ServiceLocator.Workspace;
         if (workspace != null)
         {
-            DecompilerSession session;
+            DecompilerSessionLease lease;
             if (!string.IsNullOrWhiteSpace(contextAlias))
             {
-                session = workspace.GetOrLoadSession(contextAlias);
+                lease = workspace.AcquireSession(contextAlias);
             }
             else
             {
-                session = workspace.GetCurrentSession();
+                lease = workspace.AcquireCurrentSession();
             }
 
-            return FromSession(session);
+            return FromLease(lease);
         }
 
         return GetLegacyCurrent();
@@ -40,24 +44,35 @@ internal static class ToolSessionRouter
         {
             if (!string.IsNullOrWhiteSpace(contextAlias))
             {
-                return FromSession(workspace.GetOrLoadSession(contextAlias));
+                return FromLease(workspace.AcquireSession(contextAlias));
             }
 
-            return FromSession(workspace.ResolveSessionForMemberId(memberId));
+            return FromLease(workspace.AcquireSessionForMemberId(memberId));
         }
 
         return GetLegacyCurrent();
     }
 
-    private static ToolSessionView FromSession(DecompilerSession session)
+    public static ToolSessionView? TryGetCurrentLoaded()
     {
+        var workspace = ServiceLocator.Workspace;
+        if (workspace == null || !workspace.TryAcquireCurrentLoadedSession(out var lease))
+            return null;
+
+        return FromLease(lease);
+    }
+
+    private static ToolSessionView FromLease(DecompilerSessionLease lease)
+    {
+        var session = lease.Session;
         return new ToolSessionView(
             session.ContextAlias,
             session.ContextManager,
             session.MemberResolver,
             session.DecompilerService,
             session.UsageAnalyzer,
-            session.InheritanceAnalyzer);
+            session.InheritanceAnalyzer,
+            lease);
     }
 
     private static ToolSessionView GetLegacyCurrent()

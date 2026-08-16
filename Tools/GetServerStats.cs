@@ -15,39 +15,35 @@ public static class GetServerStatsTool
             var workspace = ServiceLocator.Workspace;
             if (workspace != null)
             {
-                DecompilerSession? session = null;
-                if (!string.IsNullOrWhiteSpace(contextAlias))
-                {
-                    session = workspace.GetOrLoadSession(contextAlias);
-                }
-                else
-                {
-                    workspace.TryGetCurrentSession(out session!);
-                }
+                using var sessionView = !string.IsNullOrWhiteSpace(contextAlias)
+                    ? ToolSessionRouter.GetForContext(contextAlias)
+                    : ToolSessionRouter.TryGetCurrentLoaded();
 
                 var loadedContexts = workspace.ListContexts().ToList();
+                var memory = workspace.GetMemoryStats(sessionView?.Lease?.Session);
                 var workspaceStats = new
                 {
-                    loaded = session?.ContextManager.IsLoaded ?? false,
+                    loaded = sessionView?.ContextManager.IsLoaded ?? false,
                     currentContextAlias = workspace.CurrentContextAlias,
-                    contextAlias = session?.ContextAlias,
+                    contextAlias = sessionView?.ContextAlias,
                     loadedContexts,
-                    assemblyPath = session?.ContextManager.AssemblyPath,
-                    mvid = session?.ContextManager.Mvid,
-                    loadedAt = session?.ContextManager.LoadedAtUtc,
-                    indexes = session?.ContextManager.GetIndexStats(),
-                    caches = session == null ? null : new
+                    memory,
+                    assemblyPath = sessionView?.ContextManager.AssemblyPath,
+                    mvid = sessionView?.ContextManager.Mvid,
+                    loadedAt = sessionView?.ContextManager.LoadedAtUtc,
+                    indexes = sessionView?.ContextManager.GetIndexStats(),
+                    caches = sessionView == null ? null : new
                     {
-                        decompiler = session.DecompilerService.GetCacheStats(),
-                        memberResolver = session.MemberResolver.GetCacheStats(),
-                        usageAnalyzer = session.UsageAnalyzer.GetCacheStats()
+                        decompiler = sessionView.DecompilerService.GetCacheStats(),
+                        memberResolver = sessionView.MemberResolver.GetCacheStats(),
+                        usageAnalyzer = sessionView.UsageAnalyzer.GetCacheStats()
                     },
-                    performance = session == null ? null : new
+                    performance = sessionView == null ? null : new
                     {
-                        typeIndexReady = session.ContextManager.TypeIndexReady,
-                        namespaceIndexReady = session.ContextManager.NamespaceIndexReady,
-                        memberIndexReady = session.ContextManager.MemberIndexReady,
-                        estimatedMemoryUsage = EstimateMemoryUsage(session.DecompilerService, session.MemberResolver, session.UsageAnalyzer)
+                        typeIndexReady = sessionView.ContextManager.TypeIndexReady,
+                        namespaceIndexReady = sessionView.ContextManager.NamespaceIndexReady,
+                        memberIndexReady = sessionView.ContextManager.MemberIndexReady,
+                        estimatedMemoryUsage = EstimateMemoryUsage(sessionView.DecompilerService, sessionView.MemberResolver, sessionView.UsageAnalyzer)
                     }
                 };
 

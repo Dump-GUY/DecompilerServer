@@ -12,7 +12,7 @@ public static class ClearCachesTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var decompilerService = session.DecompilerService;
             var memberResolver = session.MemberResolver;
             var usageAnalyzer = session.UsageAnalyzer;

@@ -1,11 +1,14 @@
 using System.Text.RegularExpressions;
 using System.Text.Json;
+using ICSharpCode.Decompiler;
 
 namespace DecompilerServer.Services;
 
 public sealed class DecompilerWorkspace : IDisposable
 {
     private const string DefaultContextAlias = "default";
+    public const int DefaultMaxLoadedContexts = 4;
+    public const string MaxLoadedContextsEnvironmentVariable = "DECOMPILER_MAX_LOADED_CONTEXTS";
     private static readonly JsonSerializerOptions RegistrySerializerOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -14,18 +17,35 @@ public sealed class DecompilerWorkspace : IDisposable
 
     private readonly ReaderWriterLockSlim _lock = new();
     private readonly object _activationLock = new();
-    private readonly Dictionary<string, DecompilerSession> _sessionsByAlias = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, LoadedSessionState> _sessionsByAlias = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _aliasByMvid = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _mvidByAlias = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, WorkspaceLoadRequest> _loadRequestsByAlias = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DecompilerSettings> _settingsByAlias = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _evictedAliases = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _registryPath;
     private WorkspaceRegistryState _registryState;
+    private long _accessSequence;
+    private long _evictionCount;
+    private long _reloadCount;
     private bool _disposed;
 
     public string? CurrentContextAlias { get; private set; }
+    public int MaxLoadedContexts { get; }
 
-    public DecompilerWorkspace(string? registryPath = null)
+    public DecompilerWorkspace(string? registryPath = null, int? maxLoadedContexts = null)
     {
+        MaxLoadedContexts = maxLoadedContexts ?? ReadMaxLoadedContextsFromEnvironment();
+        if (MaxLoadedContexts <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxLoadedContexts), "The loaded context limit must be greater than zero.");
+
         _registryPath = registryPath ?? GetDefaultRegistryPath();
         _registryState = LoadRegistryState(_registryPath);
+        foreach (var entry in _registryState.Contexts)
+        {
+            _loadRequestsByAlias[entry.ContextAlias] = CreateLoadRequest(entry);
+        }
+
         CurrentContextAlias = _registryState.Contexts.Any(entry =>
             string.Equals(entry.ContextAlias, _registryState.CurrentContextAlias, StringComparison.OrdinalIgnoreCase))
             ? _registryState.CurrentContextAlias
@@ -35,45 +55,11 @@ public sealed class DecompilerWorkspace : IDisposable
     public WorkspaceContextInfo LoadAssembly(WorkspaceLoadRequest request)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-
         ValidateRequest(request);
 
-        var contextAlias = NormalizeAlias(request.ContextAlias);
-        var session = DecompilerSession.Create(contextAlias, request);
-
-        _lock.EnterWriteLock();
-        try
+        lock (_activationLock)
         {
-            if (_sessionsByAlias.TryGetValue(contextAlias, out var existing))
-            {
-                RemoveSessionMappings(existing);
-                existing.Dispose();
-            }
-
-            _sessionsByAlias[contextAlias] = session;
-            AddSessionMappings(session);
-
-            if (request.MakeCurrent || CurrentContextAlias == null)
-            {
-                CurrentContextAlias = contextAlias;
-            }
-
-            if (request.PersistRegistration)
-            {
-                UpsertRegistryEntry(contextAlias, request);
-                SaveRegistryState();
-            }
-
-            return session.ToContextInfo(isCurrent: string.Equals(CurrentContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
-        }
-        catch
-        {
-            session.Dispose();
-            throw;
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
+            return LoadAssemblyCore(request, restoreRuntimeSettings: false);
         }
     }
 
@@ -84,14 +70,13 @@ public sealed class DecompilerWorkspace : IDisposable
         if (string.IsNullOrWhiteSpace(contextAlias))
             throw new ArgumentException("Context alias cannot be empty.", nameof(contextAlias));
 
-        var session = GetOrLoadSession(contextAlias);
-
+        using var lease = AcquireSession(contextAlias);
         _lock.EnterWriteLock();
         try
         {
-            CurrentContextAlias = session.ContextAlias;
+            CurrentContextAlias = lease.Session.ContextAlias;
             SaveRegistryState();
-            return session.ToContextInfo(isCurrent: true);
+            return lease.Session.ToContextInfo(isCurrent: true);
         }
         finally
         {
@@ -107,7 +92,7 @@ public sealed class DecompilerWorkspace : IDisposable
         try
         {
             return _sessionsByAlias.Values
-                .Select(session => session.ToContextInfo(isCurrent: string.Equals(CurrentContextAlias, session.ContextAlias, StringComparison.OrdinalIgnoreCase)))
+                .Select(state => state.Session.ToContextInfo(isCurrent: string.Equals(CurrentContextAlias, state.Session.ContextAlias, StringComparison.OrdinalIgnoreCase)))
                 .OrderBy(info => info.ContextAlias, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
@@ -117,30 +102,27 @@ public sealed class DecompilerWorkspace : IDisposable
         }
     }
 
-    public bool TryGetCurrentSession(out DecompilerSession session)
+    public bool TryAcquireCurrentLoadedSession(out DecompilerSessionLease lease)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _lock.EnterReadLock();
+        _lock.EnterWriteLock();
         try
         {
-            if (CurrentContextAlias != null && _sessionsByAlias.TryGetValue(CurrentContextAlias, out session!))
+            if (CurrentContextAlias != null && TryAcquireLoadedSessionLocked(CurrentContextAlias, out lease))
                 return true;
 
-            session = null!;
+            lease = null!;
             return false;
         }
         finally
         {
-            _lock.ExitReadLock();
+            _lock.ExitWriteLock();
         }
     }
 
-    public DecompilerSession GetCurrentSession()
+    public DecompilerSessionLease AcquireCurrentSession()
     {
-        if (TryGetCurrentSession(out var session))
-            return session;
-
         string? currentContextAlias;
         _lock.EnterReadLock();
         try
@@ -155,58 +137,68 @@ public sealed class DecompilerWorkspace : IDisposable
         if (currentContextAlias == null)
             throw new InvalidOperationException("No context is currently selected.");
 
-        return GetOrLoadSession(currentContextAlias);
+        return AcquireSession(currentContextAlias);
     }
 
-    public bool TryGetSession(string contextAlias, out DecompilerSession session)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        _lock.EnterReadLock();
-        try
-        {
-            return _sessionsByAlias.TryGetValue(contextAlias, out session!);
-        }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
-    }
-
-    public DecompilerSession GetOrLoadSession(string contextAlias)
+    public DecompilerSessionLease AcquireSession(string contextAlias)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         if (string.IsNullOrWhiteSpace(contextAlias))
             throw new ArgumentException("Context alias cannot be empty.", nameof(contextAlias));
 
-        if (TryGetSession(contextAlias, out var loadedSession))
-            return loadedSession;
+        var normalizedAlias = NormalizeAlias(contextAlias);
+
+        _lock.EnterWriteLock();
+        try
+        {
+            if (TryAcquireLoadedSessionLocked(normalizedAlias, out var loadedLease))
+                return loadedLease;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
 
         lock (_activationLock)
         {
-            if (TryGetSession(contextAlias, out loadedSession))
-                return loadedSession;
+            _lock.EnterWriteLock();
+            try
+            {
+                if (TryAcquireLoadedSessionLocked(normalizedAlias, out var loadedLease))
+                    return loadedLease;
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
 
-            WorkspaceRegistryEntry? entry;
+            WorkspaceLoadRequest? request;
             _lock.EnterReadLock();
             try
             {
-                entry = _registryState.Contexts.FirstOrDefault(candidate =>
-                    string.Equals(candidate.ContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
+                _loadRequestsByAlias.TryGetValue(normalizedAlias, out request);
             }
             finally
             {
                 _lock.ExitReadLock();
             }
 
-            if (entry == null)
+            if (request == null)
                 throw new InvalidOperationException($"Context alias '{contextAlias}' is not loaded or registered.");
 
-            LoadAssembly(CreateLoadRequest(entry));
+            LoadAssemblyCore(request, restoreRuntimeSettings: true);
 
-            if (TryGetSession(entry.ContextAlias, out loadedSession))
-                return loadedSession;
+            _lock.EnterWriteLock();
+            try
+            {
+                if (TryAcquireLoadedSessionLocked(normalizedAlias, out var loadedLease))
+                    return loadedLease;
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
 
             throw new InvalidOperationException($"Context alias '{contextAlias}' could not be loaded.");
         }
@@ -230,32 +222,7 @@ public sealed class DecompilerWorkspace : IDisposable
         }
     }
 
-    public bool TryGetSessionByMvid(string mvid, out DecompilerSession session)
-    {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-
-        if (string.IsNullOrWhiteSpace(mvid))
-        {
-            session = null!;
-            return false;
-        }
-
-        _lock.EnterReadLock();
-        try
-        {
-            if (_aliasByMvid.TryGetValue(mvid, out var alias) && _sessionsByAlias.TryGetValue(alias, out session!))
-                return true;
-
-            session = null!;
-            return false;
-        }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
-    }
-
-    public DecompilerSession ResolveSessionForMemberId(string memberId)
+    public DecompilerSessionLease AcquireSessionForMemberId(string memberId)
     {
         if (string.IsNullOrWhiteSpace(memberId))
             throw new ArgumentException("Member ID cannot be empty.", nameof(memberId));
@@ -264,59 +231,87 @@ public sealed class DecompilerWorkspace : IDisposable
         if (separatorIndex > 0)
         {
             var prefix = memberId[..separatorIndex];
-            if (LooksLikeMvid(prefix) && TryGetSessionByMvid(prefix, out var sessionByMvid))
-                return sessionByMvid;
+            if (LooksLikeMvid(prefix))
+            {
+                string? contextAlias;
+                _lock.EnterReadLock();
+                try
+                {
+                    _aliasByMvid.TryGetValue(prefix, out contextAlias);
+                }
+                finally
+                {
+                    _lock.ExitReadLock();
+                }
+
+                if (contextAlias != null)
+                    return AcquireSession(contextAlias);
+            }
         }
 
-        return GetCurrentSession();
+        return AcquireCurrentSession();
     }
 
     public void UnloadContext(string? contextAlias = null, bool preserveRegistration = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _lock.EnterWriteLock();
-        try
+        DecompilerSession? sessionToDispose = null;
+        lock (_activationLock)
         {
-            var aliasToUnload = string.IsNullOrWhiteSpace(contextAlias) ? CurrentContextAlias : contextAlias;
-            if (string.IsNullOrWhiteSpace(aliasToUnload))
-                throw new InvalidOperationException("No context is currently selected.");
-
-            var isRegistered = _registryState.Contexts.Any(entry =>
-                string.Equals(entry.ContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase));
-            var isLoaded = _sessionsByAlias.TryGetValue(aliasToUnload, out var session);
-            if (!isLoaded && !isRegistered)
-                throw new InvalidOperationException($"Context alias '{aliasToUnload}' is not loaded or registered.");
-
-            var wasCurrent = string.Equals(CurrentContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase);
-            if (isLoaded)
+            try
             {
-                RemoveSessionMappings(session!);
-                session!.Dispose();
-            }
+                _lock.EnterWriteLock();
+                try
+                {
+                    var aliasToUnload = string.IsNullOrWhiteSpace(contextAlias) ? CurrentContextAlias : NormalizeAlias(contextAlias);
+                    if (string.IsNullOrWhiteSpace(aliasToUnload))
+                        throw new InvalidOperationException("No context is currently selected.");
 
-            if (!preserveRegistration)
-            {
-                _registryState.Contexts.RemoveAll(entry => string.Equals(entry.ContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase));
-            }
+                    var isAvailable = _loadRequestsByAlias.ContainsKey(aliasToUnload);
+                    var isLoaded = _sessionsByAlias.TryGetValue(aliasToUnload, out var state);
+                    if (!isLoaded && !isAvailable)
+                        throw new InvalidOperationException($"Context alias '{aliasToUnload}' is not loaded or registered.");
 
-            if (wasCurrent && preserveRegistration && isRegistered)
-            {
-                CurrentContextAlias = aliasToUnload;
-            }
-            else if (CurrentContextAlias == null)
-            {
-                CurrentContextAlias = _sessionsByAlias.Keys
-                    .Concat(_registryState.Contexts.Select(entry => entry.ContextAlias))
-                    .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
-                    .FirstOrDefault();
-            }
+                    if (isLoaded)
+                    {
+                        EnsureNotLeased(state!, aliasToUnload);
+                        if (preserveRegistration)
+                            _settingsByAlias[aliasToUnload] = state!.Session.ContextManager.GetSettings();
 
-            SaveRegistryState();
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
+                        _sessionsByAlias.Remove(aliasToUnload);
+                        sessionToDispose = state!.Session;
+                    }
+
+                    var wasCurrent = string.Equals(CurrentContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase);
+                    if (!preserveRegistration)
+                    {
+                        _registryState.Contexts.RemoveAll(entry => string.Equals(entry.ContextAlias, aliasToUnload, StringComparison.OrdinalIgnoreCase));
+                        _loadRequestsByAlias.Remove(aliasToUnload);
+                        _settingsByAlias.Remove(aliasToUnload);
+                        _evictedAliases.Remove(aliasToUnload);
+                        RemoveAliasRoutingLocked(aliasToUnload);
+                    }
+
+                    if (wasCurrent && !preserveRegistration)
+                    {
+                        CurrentContextAlias = _sessionsByAlias.Keys
+                            .Concat(_loadRequestsByAlias.Keys)
+                            .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+                            .FirstOrDefault();
+                    }
+
+                    SaveRegistryState();
+                }
+                finally
+                {
+                    _lock.ExitWriteLock();
+                }
+            }
+            finally
+            {
+                sessionToDispose?.Dispose();
+            }
         }
     }
 
@@ -324,34 +319,64 @@ public sealed class DecompilerWorkspace : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _lock.EnterWriteLock();
-        try
+        var sessionsToDispose = new List<DecompilerSession>();
+        lock (_activationLock)
         {
-            var selectedAlias = CurrentContextAlias;
-            foreach (var session in _sessionsByAlias.Values)
+            try
             {
-                session.Dispose();
-            }
+                _lock.EnterWriteLock();
+                try
+                {
+                    var leasedAliases = _sessionsByAlias.Values
+                        .Where(state => state.ActiveLeaseCount > 0)
+                        .Select(state => state.Session.ContextAlias)
+                        .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+                    if (leasedAliases.Length > 0)
+                        throw CreateContextBusyError(leasedAliases);
 
-            _sessionsByAlias.Clear();
-            _aliasByMvid.Clear();
-            if (!preserveRegistration)
-            {
-                _registryState.Contexts.Clear();
-                CurrentContextAlias = null;
+                    var selectedAlias = CurrentContextAlias;
+                    if (preserveRegistration)
+                    {
+                        foreach (var state in _sessionsByAlias.Values)
+                        {
+                            _settingsByAlias[state.Session.ContextAlias] = state.Session.ContextManager.GetSettings();
+                        }
+                    }
+
+                    sessionsToDispose = _sessionsByAlias.Values.Select(state => state.Session).ToList();
+                    _sessionsByAlias.Clear();
+                    if (!preserveRegistration)
+                    {
+                        _registryState.Contexts.Clear();
+                        _loadRequestsByAlias.Clear();
+                        _settingsByAlias.Clear();
+                        _aliasByMvid.Clear();
+                        _mvidByAlias.Clear();
+                        _evictedAliases.Clear();
+                        CurrentContextAlias = null;
+                    }
+                    else
+                    {
+                        CurrentContextAlias = selectedAlias != null && _loadRequestsByAlias.ContainsKey(selectedAlias)
+                            ? selectedAlias
+                            : null;
+                    }
+
+                    SaveRegistryState();
+                }
+                finally
+                {
+                    _lock.ExitWriteLock();
+                }
             }
-            else
+            finally
             {
-                CurrentContextAlias = _registryState.Contexts.Any(entry =>
-                    string.Equals(entry.ContextAlias, selectedAlias, StringComparison.OrdinalIgnoreCase))
-                    ? selectedAlias
-                    : null;
+                foreach (var session in sessionsToDispose)
+                {
+                    session.Dispose();
+                }
             }
-            SaveRegistryState();
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
         }
     }
 
@@ -360,27 +385,232 @@ public sealed class DecompilerWorkspace : IDisposable
         if (_disposed)
             return;
 
+        lock (_activationLock)
+        {
+            _lock.EnterWriteLock();
+            try
+            {
+                if (_disposed)
+                    return;
+
+                foreach (var state in _sessionsByAlias.Values)
+                {
+                    state.Session.Dispose();
+                }
+
+                _sessionsByAlias.Clear();
+                _aliasByMvid.Clear();
+                _mvidByAlias.Clear();
+                _loadRequestsByAlias.Clear();
+                _settingsByAlias.Clear();
+                _evictedAliases.Clear();
+                CurrentContextAlias = null;
+                _disposed = true;
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
+        }
+    }
+
+    public WorkspaceMemoryStats GetMemoryStats()
+    {
+        return GetMemoryStats(excludedSession: null);
+    }
+
+    internal WorkspaceMemoryStats GetMemoryStats(DecompilerSession? excludedSession)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        _lock.EnterReadLock();
+        try
+        {
+            var excludedLeaseCount = excludedSession != null
+                && _sessionsByAlias.TryGetValue(excludedSession.ContextAlias, out var excludedState)
+                && ReferenceEquals(excludedState.Session, excludedSession)
+                && excludedState.ActiveLeaseCount > 0
+                    ? 1
+                    : 0;
+
+            return new WorkspaceMemoryStats
+            {
+                MaxLoadedContexts = MaxLoadedContexts,
+                LoadedContexts = _sessionsByAlias.Count,
+                ActiveLeases = _sessionsByAlias.Values.Sum(state => state.ActiveLeaseCount) - excludedLeaseCount,
+                Evictions = _evictionCount,
+                Reloads = _reloadCount,
+                LeasedAliases = _sessionsByAlias.Values
+                    .Where(state => state.ActiveLeaseCount - (ReferenceEquals(state.Session, excludedSession) ? excludedLeaseCount : 0) > 0)
+                    .Select(state => state.Session.ContextAlias)
+                    .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+                    .ToArray()
+            };
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+    }
+
+    internal void ReleaseSession(DecompilerSession session)
+    {
+        if (_disposed)
+            return;
+
         _lock.EnterWriteLock();
         try
         {
-            if (_disposed)
-                return;
-
-            foreach (var session in _sessionsByAlias.Values)
+            if (_sessionsByAlias.TryGetValue(session.ContextAlias, out var state)
+                && ReferenceEquals(state.Session, session)
+                && state.ActiveLeaseCount > 0)
             {
-                session.Dispose();
+                state.ActiveLeaseCount--;
+                state.LastUsedSequence = ++_accessSequence;
             }
-
-            _sessionsByAlias.Clear();
-            _aliasByMvid.Clear();
-            CurrentContextAlias = null;
-            _disposed = true;
         }
         finally
         {
             _lock.ExitWriteLock();
-            _lock.Dispose();
         }
+    }
+
+    private WorkspaceContextInfo LoadAssemblyCore(WorkspaceLoadRequest request, bool restoreRuntimeSettings)
+    {
+        var contextAlias = NormalizeAlias(request.ContextAlias);
+        DecompilerSession? sessionToDispose = null;
+        DecompilerSettings? settingsToRestore = null;
+
+        _lock.EnterWriteLock();
+        try
+        {
+            if (_sessionsByAlias.TryGetValue(contextAlias, out var existingState))
+            {
+                EnsureNotLeased(existingState, contextAlias);
+                _sessionsByAlias.Remove(contextAlias);
+                sessionToDispose = existingState.Session;
+            }
+            else if (_sessionsByAlias.Count >= MaxLoadedContexts)
+            {
+                var evictionCandidate = _sessionsByAlias.Values
+                    .Where(state => state.ActiveLeaseCount == 0)
+                    .OrderBy(state => state.LastUsedSequence)
+                    .ThenBy(state => state.Session.ContextAlias, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault();
+
+                if (evictionCandidate == null)
+                    throw CreateCapacityBusyError();
+
+                var evictedAlias = evictionCandidate.Session.ContextAlias;
+                _settingsByAlias[evictedAlias] = evictionCandidate.Session.ContextManager.GetSettings();
+                _sessionsByAlias.Remove(evictedAlias);
+                _evictedAliases.Add(evictedAlias);
+                _evictionCount++;
+                sessionToDispose = evictionCandidate.Session;
+            }
+
+            if (restoreRuntimeSettings)
+                _settingsByAlias.TryGetValue(contextAlias, out settingsToRestore);
+            else
+                _settingsByAlias.Remove(contextAlias);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+
+        sessionToDispose?.Dispose();
+
+        var session = DecompilerSession.Create(contextAlias, request);
+        var sessionOwnedByWorkspace = false;
+        try
+        {
+            if (settingsToRestore != null)
+                session.ContextManager.UpdateSettings(settingsToRestore);
+
+            _lock.EnterWriteLock();
+            try
+            {
+                _sessionsByAlias[contextAlias] = new LoadedSessionState(session, ++_accessSequence);
+                sessionOwnedByWorkspace = true;
+                UpdateAliasRoutingLocked(session);
+                _loadRequestsByAlias[contextAlias] = CreateActivationRequest(contextAlias, request);
+
+                if (restoreRuntimeSettings && _evictedAliases.Remove(contextAlias))
+                    _reloadCount++;
+                else if (!restoreRuntimeSettings)
+                    _evictedAliases.Remove(contextAlias);
+
+                if (request.MakeCurrent || CurrentContextAlias == null)
+                    CurrentContextAlias = contextAlias;
+
+                if (request.PersistRegistration)
+                {
+                    UpsertRegistryEntry(contextAlias, request);
+                    SaveRegistryState();
+                }
+
+                return session.ToContextInfo(isCurrent: string.Equals(CurrentContextAlias, contextAlias, StringComparison.OrdinalIgnoreCase));
+            }
+            finally
+            {
+                _lock.ExitWriteLock();
+            }
+        }
+        catch
+        {
+            if (!sessionOwnedByWorkspace)
+                session.Dispose();
+            throw;
+        }
+    }
+
+    private bool TryAcquireLoadedSessionLocked(string contextAlias, out DecompilerSessionLease lease)
+    {
+        if (_sessionsByAlias.TryGetValue(contextAlias, out var state))
+        {
+            state.ActiveLeaseCount++;
+            state.LastUsedSequence = ++_accessSequence;
+            lease = new DecompilerSessionLease(this, state.Session);
+            return true;
+        }
+
+        lease = null!;
+        return false;
+    }
+
+    private ToolErrorException CreateCapacityBusyError()
+    {
+        var leasedAliases = _sessionsByAlias.Values
+            .Where(state => state.ActiveLeaseCount > 0)
+            .Select(state => state.Session.ContextAlias)
+            .OrderBy(alias => alias, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return new ToolErrorException(
+            "context_capacity_busy",
+            "All loaded contexts are currently in use.",
+            new
+            {
+                maxLoadedContexts = MaxLoadedContexts,
+                loadedContexts = _sessionsByAlias.Count,
+                activeLeases = _sessionsByAlias.Values.Sum(state => state.ActiveLeaseCount),
+                leasedAliases
+            });
+    }
+
+    private static void EnsureNotLeased(LoadedSessionState state, string contextAlias)
+    {
+        if (state.ActiveLeaseCount > 0)
+            throw CreateContextBusyError([contextAlias]);
+    }
+
+    private static ToolErrorException CreateContextBusyError(IReadOnlyCollection<string> contextAliases)
+    {
+        return new ToolErrorException(
+            "context_busy",
+            "One or more contexts are currently in use.",
+            new { contextAliases });
     }
 
     private static void ValidateRequest(WorkspaceLoadRequest request)
@@ -415,6 +645,21 @@ public sealed class DecompilerWorkspace : IDisposable
             AdditionalSearchDirs = entry.AdditionalSearchDirs,
             RebuildIndex = entry.RebuildIndex,
             ContextAlias = entry.ContextAlias,
+            MakeCurrent = false,
+            PersistRegistration = false
+        };
+    }
+
+    private static WorkspaceLoadRequest CreateActivationRequest(string contextAlias, WorkspaceLoadRequest request)
+    {
+        return new WorkspaceLoadRequest
+        {
+            GameDir = request.GameDir,
+            AssemblyPath = request.AssemblyPath,
+            AssemblyFile = request.AssemblyFile,
+            AdditionalSearchDirs = request.AdditionalSearchDirs,
+            RebuildIndex = request.RebuildIndex,
+            ContextAlias = contextAlias,
             MakeCurrent = false,
             PersistRegistration = false
         };
@@ -475,46 +720,76 @@ public sealed class DecompilerWorkspace : IDisposable
         return Path.Combine(baseDir, "DecompilerServer", "contexts.json");
     }
 
-    private void RemoveSessionMappings(DecompilerSession session)
+    private static int ReadMaxLoadedContextsFromEnvironment()
     {
-        _sessionsByAlias.Remove(session.ContextAlias);
-
-        var mvid = session.ContextManager.Mvid;
-        if (mvid != null &&
-            _aliasByMvid.TryGetValue(mvid, out var mappedAlias) &&
-            string.Equals(mappedAlias, session.ContextAlias, StringComparison.OrdinalIgnoreCase))
-        {
-            _aliasByMvid.Remove(mvid);
-
-            var replacement = FindReplacementSessionForMvid(mvid);
-            if (replacement != null)
-                _aliasByMvid[mvid] = replacement.ContextAlias;
-        }
-
-        if (string.Equals(CurrentContextAlias, session.ContextAlias, StringComparison.OrdinalIgnoreCase))
-            CurrentContextAlias = null;
+        var configuredValue = Environment.GetEnvironmentVariable(MaxLoadedContextsEnvironmentVariable);
+        return int.TryParse(configuredValue, out var parsedValue) && parsedValue > 0
+            ? parsedValue
+            : DefaultMaxLoadedContexts;
     }
 
-    private void AddSessionMappings(DecompilerSession session)
+    private void UpdateAliasRoutingLocked(DecompilerSession session)
     {
+        var contextAlias = session.ContextAlias;
         var mvid = session.ContextManager.Mvid;
-        if (mvid != null && !_aliasByMvid.ContainsKey(mvid))
-            _aliasByMvid[mvid] = session.ContextAlias;
-    }
+        if (mvid == null)
+            return;
 
-    private DecompilerSession? FindReplacementSessionForMvid(string mvid)
-    {
-        if (CurrentContextAlias != null &&
-            _sessionsByAlias.TryGetValue(CurrentContextAlias, out var currentSession) &&
-            string.Equals(currentSession.ContextManager.Mvid, mvid, StringComparison.OrdinalIgnoreCase))
+        if (_mvidByAlias.TryGetValue(contextAlias, out var previousMvid)
+            && !string.Equals(previousMvid, mvid, StringComparison.OrdinalIgnoreCase))
         {
-            return currentSession;
+            RemoveAliasRoutingLocked(contextAlias);
         }
 
-        return _sessionsByAlias.Values
-            .Where(candidate => string.Equals(candidate.ContextManager.Mvid, mvid, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(candidate => candidate.ContextAlias, StringComparer.OrdinalIgnoreCase)
+        _mvidByAlias[contextAlias] = mvid;
+        if (!_aliasByMvid.ContainsKey(mvid))
+            _aliasByMvid[mvid] = contextAlias;
+    }
+
+    private void RemoveAliasRoutingLocked(string contextAlias)
+    {
+        if (!_mvidByAlias.Remove(contextAlias, out var mvid))
+            return;
+
+        if (!_aliasByMvid.TryGetValue(mvid, out var mappedAlias)
+            || !string.Equals(mappedAlias, contextAlias, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        _aliasByMvid.Remove(mvid);
+        var replacementAlias = _mvidByAlias
+            .Where(pair => string.Equals(pair.Value, mvid, StringComparison.OrdinalIgnoreCase))
+            .Select(pair => pair.Key)
+            .OrderBy(alias => string.Equals(alias, CurrentContextAlias, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(alias => alias, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
+
+        if (replacementAlias != null)
+            _aliasByMvid[mvid] = replacementAlias;
+    }
+
+    private sealed class LoadedSessionState(DecompilerSession session, long lastUsedSequence)
+    {
+        public DecompilerSession Session { get; } = session;
+        public long LastUsedSequence { get; set; } = lastUsedSequence;
+        public int ActiveLeaseCount { get; set; }
+    }
+}
+
+public sealed class DecompilerSessionLease : IDisposable
+{
+    private DecompilerWorkspace? _workspace;
+
+    internal DecompilerSessionLease(DecompilerWorkspace workspace, DecompilerSession session)
+    {
+        _workspace = workspace;
+        Session = session;
+    }
+
+    public DecompilerSession Session { get; }
+
+    public void Dispose()
+    {
+        Interlocked.Exchange(ref _workspace, null)?.ReleaseSession(Session);
     }
 }
 
@@ -629,6 +904,16 @@ public sealed record WorkspaceContextInfo
     public int MethodCount { get; init; }
     public int NamespaceCount { get; init; }
     public bool IsCurrent { get; init; }
+}
+
+public sealed record WorkspaceMemoryStats
+{
+    public int MaxLoadedContexts { get; init; }
+    public int LoadedContexts { get; init; }
+    public int ActiveLeases { get; init; }
+    public long Evictions { get; init; }
+    public long Reloads { get; init; }
+    public required string[] LeasedAliases { get; init; }
 }
 
 internal sealed record WorkspaceRegistryState

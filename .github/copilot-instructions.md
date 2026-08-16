@@ -9,8 +9,8 @@ Read these files first:
 
 - MCP tools live as static methods under `Tools/`.
 - Tools should return via `ResponseFormatter.TryExecute(...)`.
-- Discovery/search tools should route with `ToolSessionRouter.GetForContext(...)`.
-- `memberId` follow-up tools should route with `ToolSessionRouter.GetForMember(...)`.
+- Discovery/search tools should route with `using var session = ToolSessionRouter.GetForContext(...)`.
+- `memberId` follow-up tools should route with `using var session = ToolSessionRouter.GetForMember(...)`.
 - Reuse `TypeSurfaceComparer` for type-surface semantics instead of duplicating compare logic.
 - Use `DecompilerService.DecompileEntitySnippet(...)` for focused compare body retrieval.
 - Prefer structured JSON output over pre-rendered diff text for overview commands.

@@ -13,7 +13,7 @@ public static class ResolveMemberIdTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
             var memberResolver = session.MemberResolver;
             var contextManager = session.ContextManager;
 

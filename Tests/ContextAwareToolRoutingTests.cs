@@ -65,7 +65,8 @@ public class ContextAwareToolRoutingTests : IDisposable
             makeCurrent: true);
 
         var workspace = _serviceProvider.GetRequiredService<DecompilerWorkspace>();
-        Assert.True(workspace.TryGetSession("rw14", out var rw14Session));
+        using var rw14Lease = workspace.AcquireSession("rw14");
+        var rw14Session = rw14Lease.Session;
 
         var simpleType = rw14Session.ContextManager.GetAllTypes().First(type => type.FullName == "TestLibrary.SimpleClass");
         var memberId = rw14Session.MemberResolver.GenerateMemberId(simpleType);
@@ -123,7 +124,8 @@ public class ContextAwareToolRoutingTests : IDisposable
             makeCurrent: true);
 
         var workspace = _serviceProvider.GetRequiredService<DecompilerWorkspace>();
-        Assert.True(workspace.TryGetSession("rw14", out var rw14Session));
+        using var rw14Lease = workspace.AcquireSession("rw14");
+        var rw14Session = rw14Lease.Session;
 
         var testType = rw14Session.ContextManager.GetAllTypes().First(type => type.FullName == "TestLibrary.SimpleClass");
         var method = requireInstanceMethod

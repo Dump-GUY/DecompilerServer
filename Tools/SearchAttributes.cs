@@ -16,7 +16,7 @@ public static class SearchAttributesTool
             if (limit <= 0)
                 throw new ArgumentException("limit must be greater than 0.", nameof(limit));
 
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var memberResolver = session.MemberResolver;
 

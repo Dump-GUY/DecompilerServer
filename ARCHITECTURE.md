@@ -36,7 +36,10 @@ Responsibilities:
 - holds the alias-to-session map;
 - maps assembly MVID to alias for follow-up routing;
 - persists registrations to disk;
-- activates registered aliases on demand.
+- activates registered aliases on demand;
+- keeps at most four sessions resident by default and evicts the least recently used idle session when capacity is reached.
+
+The resident-session limit is a hard count, configurable through `DECOMPILER_MAX_LOADED_CONTEXTS`. Registrations, load requests, runtime MVID routing, and per-context decompiler settings survive an LRU eviction, so addressing the alias or one of its member IDs can rebuild the session. If every resident session has an active lease, loading another context fails with `context_capacity_busy` instead of temporarily exceeding the limit.
 
 Registry location:
 - default path is `LocalApplicationData/DecompilerServer/contexts.json`;
@@ -54,6 +57,8 @@ A session bundles:
 - `InheritanceAnalyzer`
 
 Sessions are isolated per loaded assembly so caches and member resolution stay version-specific.
+
+Tool calls acquire a `DecompilerSessionLease` for every routed session and hold it for the entire operation. A leased session cannot be replaced, explicitly unloaded, or selected as an LRU victim. This is required because MCP tools may execute concurrently and compare tools hold two sessions at once.
 
 ### AssemblyContextManager
 
@@ -141,6 +146,7 @@ The repository currently supports both the workspace model and the older single-
 Rules:
 - discovery or search tools with no `memberId` use `GetForContext(contextAlias)`;
 - follow-up tools that take `memberId` use `GetForMember(memberId, contextAlias)`;
+- callers dispose the returned `ToolSessionView` with `using` so its workspace lease spans the full tool operation;
 - explicit `contextAlias` on a member-based tool wins over MVID routing;
 - without an explicit alias, member-based tools route by the `memberId` MVID and then fall back to the current alias.
 
@@ -151,7 +157,8 @@ Rules:
 Important behavior:
 - production uses the global provider;
 - tests can override the provider thread-locally;
-- current-session services are resolved from the workspace when available.
+- legacy singleton services remain available for the single-context fallback;
+- workspace tools obtain session-owned services through `ToolSessionRouter` leases rather than naked `ServiceLocator` references.
 
 ## Workspace and Alias Workflow
 
@@ -166,13 +173,21 @@ Operational rules:
 - `unload` can unload one alias or all aliases, and removes persisted registrations by default;
 - `unload(..., preserveRegistration: true)` keeps on-demand registrations while unloading memory;
 - `status` reports current alias plus loaded contexts when the workspace is active;
-- `get_server_stats(contextAlias)` reports detailed cache, index, and performance diagnostics for one alias or the current alias.
+- `get_server_stats(contextAlias)` reports detailed cache, index, performance, resident-limit, lease, eviction, and reload diagnostics for one alias or the current alias.
 
 Startup behavior:
 - `WorkspaceBootstrapService` registers persisted aliases without opening assemblies;
 - startup logs one registration summary;
 - the current alias and explicitly requested `contextAlias` values load on first use;
 - MVID routing applies to contexts loaded in the current server process. After a restart, callers using an older member ID for a non-current deferred alias must pass its `contextAlias` once to activate the owning context.
+
+Eviction behavior:
+- use and lease completion update recency;
+- the oldest unleased session is disposed before a replacement is created, so the resident count never crosses the configured limit;
+- current selection does not pin a session and may point to a registered but currently unloaded alias;
+- runtime MVID routing remains available after eviction, while the documented post-restart limitation still applies;
+- comparisons acquire both context leases for their full operation;
+- unloading or replacing an actively leased alias returns `context_busy`.
 
 ## Stable API Contracts
 

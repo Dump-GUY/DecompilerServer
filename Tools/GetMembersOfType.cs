@@ -13,7 +13,7 @@ public static class GetMembersOfTypeTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(typeId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(typeId, contextAlias);
             var contextManager = session.ContextManager;
             var memberResolver = session.MemberResolver;
             var normalizedLimit = MemberSummaryModes.ClampLimit(limit, 100);

@@ -13,7 +13,7 @@ public static class GetSourceSliceTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(memberId, contextAlias);
             var contextManager = session.ContextManager;
             var decompilerService = session.DecompilerService;
             var memberResolver = session.MemberResolver;

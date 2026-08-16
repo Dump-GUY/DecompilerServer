@@ -12,13 +12,18 @@ public static class PingTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var contextManager = ServiceLocator.ContextManager;
             var timeUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            using var currentSession = ServiceLocator.Workspace != null
+                ? ToolSessionRouter.TryGetCurrentLoaded()
+                : null;
+            var mvid = ServiceLocator.Workspace != null
+                ? currentSession?.ContextManager.Mvid
+                : ServiceLocator.ContextManager.IsLoaded ? ServiceLocator.ContextManager.Mvid : null;
 
             var result = new
             {
                 pong = true,
-                mvid = contextManager.IsLoaded ? contextManager.Mvid : null,
+                mvid,
                 timeUnix = timeUnix
             };
 

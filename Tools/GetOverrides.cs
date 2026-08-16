@@ -12,7 +12,7 @@ public static class GetOverridesTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(methodId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(methodId, contextAlias);
             var contextManager = session.ContextManager;
             var inheritanceAnalyzer = session.InheritanceAnalyzer;
             var memberResolver = session.MemberResolver;

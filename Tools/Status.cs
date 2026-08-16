@@ -16,8 +16,9 @@ public static class StatusTool
             if (workspace != null)
             {
                 var loadedContexts = workspace.ListContexts().ToList();
-                var hasCurrent = workspace.TryGetCurrentSession(out var currentSession);
-                var contextManager = hasCurrent ? currentSession.ContextManager : null;
+                using var currentSession = ToolSessionRouter.TryGetCurrentLoaded();
+                var hasCurrent = currentSession != null;
+                var contextManager = currentSession?.ContextManager;
                 var status = new ServerStatus
                 {
                     Loaded = loadedContexts.Count > 0,
@@ -27,13 +28,13 @@ public static class StatusTool
                     AssemblyPath = contextManager?.AssemblyPath,
                     StartedAtUnix = ToUnixTimeSeconds(contextManager?.LoadedAtUtc),
                     Settings = hasCurrent ? GetDecompilerSettings(contextManager!) : null,
-                    Stats = hasCurrent ? GetCacheStats(currentSession.DecompilerService, currentSession.MemberResolver) : null,
+                    Stats = hasCurrent ? GetCacheStats(currentSession!.DecompilerService, currentSession.MemberResolver) : null,
                     Indexes = hasCurrent ? new IndexStatus
                     {
                         Namespaces = contextManager!.NamespaceCount,
                         Types = contextManager.TypeCount,
                         NameIndexReady = contextManager.TypeIndexReady,
-                        StringLiteralIndexReady = GetStringLiteralIndexStatus(currentSession.UsageAnalyzer)
+                        StringLiteralIndexReady = GetStringLiteralIndexStatus(currentSession!.UsageAnalyzer)
                     } : null
                 };
 

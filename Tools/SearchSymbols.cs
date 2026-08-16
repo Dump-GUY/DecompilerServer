@@ -24,7 +24,7 @@ public static class SearchSymbolsTool
     {
         return ResponseFormatter.TryExecute<object>(() =>
         {
-            var session = ToolSessionRouter.GetForContext(contextAlias);
+            using var session = ToolSessionRouter.GetForContext(contextAlias);
             var contextManager = session.ContextManager;
             var memberResolver = session.MemberResolver;
 

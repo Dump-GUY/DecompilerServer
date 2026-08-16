@@ -12,7 +12,7 @@ public static class FindBaseTypesTool
     {
         return ResponseFormatter.TryExecute(() =>
         {
-            var session = ToolSessionRouter.GetForMember(typeId, contextAlias);
+            using var session = ToolSessionRouter.GetForMember(typeId, contextAlias);
             var contextManager = session.ContextManager;
             var inheritanceAnalyzer = session.InheritanceAnalyzer;
 

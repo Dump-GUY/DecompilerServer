@@ -254,6 +254,8 @@ get_server_stats({ "contextAlias": "rw16" })
 
 Registered aliases are restored lazily when the server starts. `list_contexts` returns both the currently loaded context items and `registeredAliases`; selecting or explicitly addressing a registered alias loads it on demand. This keeps a large workspace history from consuming memory and file descriptors in every MCP client process.
 
+At most four contexts are resident by default. When another context is needed, the least recently used context that is not serving a tool call is disposed while its lightweight registration remains available for transparent reload. Set `DECOMPILER_MAX_LOADED_CONTEXTS` to a positive integer in the MCP server environment to choose a different hard limit. A request returns `context_capacity_busy` rather than exceeding the limit when every resident context is actively in use.
+
 **Search and decompile:**
 
 ```text

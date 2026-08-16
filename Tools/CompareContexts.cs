@@ -24,8 +24,8 @@ public static class CompareContextsTool
             if (limit <= 0)
                 throw new ArgumentException("limit must be greater than 0.", nameof(limit));
 
-            var left = ToolSessionRouter.GetForContext(leftContextAlias);
-            var right = ToolSessionRouter.GetForContext(rightContextAlias);
+            using var left = ToolSessionRouter.GetForContext(leftContextAlias);
+            using var right = ToolSessionRouter.GetForContext(rightContextAlias);
 
             var leftTypes = GetFilteredTypes(left.ContextManager, namespaceFilter, deep, includeCompilerGenerated)
                 .ToDictionary(type => type.FullName, StringComparer.Ordinal);

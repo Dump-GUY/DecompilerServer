@@ -15,7 +15,7 @@ public static class FindDerivedTypesTool
               if (limit <= 0)
                   throw new ArgumentException("limit must be greater than 0.", nameof(limit));
 
-              var session = ToolSessionRouter.GetForMember(baseTypeId, contextAlias);
+              using var session = ToolSessionRouter.GetForMember(baseTypeId, contextAlias);
               var contextManager = session.ContextManager;
               var inheritanceAnalyzer = session.InheritanceAnalyzer;
 
