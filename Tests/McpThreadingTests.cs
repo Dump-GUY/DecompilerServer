@@ -10,6 +10,7 @@ namespace Tests;
 /// Tests to verify that MCP tools work correctly when called from different threads,
 /// simulating the real MCP server environment.
 /// </summary>
+[Collection(ServiceLocatorIsolationCollection.Name)]
 public class McpThreadingTests : ServiceTestBase
 {
     private readonly IServiceProvider _serviceProvider;

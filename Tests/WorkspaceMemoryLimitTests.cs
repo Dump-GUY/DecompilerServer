@@ -5,6 +5,13 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Tests;
 
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class ServiceLocatorIsolationCollection
+{
+    public const string Name = "ServiceLocator isolation";
+}
+
+[Collection(ServiceLocatorIsolationCollection.Name)]
 public sealed class WorkspaceMemoryLimitTests : IDisposable
 {
     private readonly string _tempDir;
